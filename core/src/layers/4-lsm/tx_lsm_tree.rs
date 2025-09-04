@@ -147,11 +147,31 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
         on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
     ) -> Result<Self> {
-        let inner = TreeInner::format(
+        Self::format_with_capacity(
             tx_log_store,
             listener_factory,
             on_drop_record_in_memtable,
             sync_id_store,
+            MEMTABLE_CAPACITY,
+        )
+    }
+
+    /// Format a `TxLsmTree` from a given `TxLogStore` with custom capacity.
+    pub fn format_with_capacity(
+        tx_log_store: Arc<TxLogStore<D>>,
+        listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
+        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
+        sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        memtable_capacity: usize,
+    ) -> Result<Self> {
+        #[cfg(not(feature = "linux"))]
+        info!("[TxLsmTree] Formatting with custom memtable_capacity: {} bytes", memtable_capacity);
+        let inner = TreeInner::format_with_capacity(
+            tx_log_store,
+            listener_factory,
+            on_drop_record_in_memtable,
+            sync_id_store,
+            memtable_capacity,
         )?;
         Ok(Self(Arc::new(inner)))
     }
@@ -163,11 +183,31 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
         on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
     ) -> Result<Self> {
-        let inner = TreeInner::recover(
+        Self::recover_with_capacity(
             tx_log_store,
             listener_factory,
             on_drop_record_in_memtable,
             sync_id_store,
+            MEMTABLE_CAPACITY,
+        )
+    }
+
+    /// Recover a `TxLsmTree` from a given `TxLogStore` with custom capacity.
+    pub fn recover_with_capacity(
+        tx_log_store: Arc<TxLogStore<D>>,
+        listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
+        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
+        sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        memtable_capacity: usize,
+    ) -> Result<Self> {
+        #[cfg(not(feature = "linux"))]
+        info!("[TxLsmTree] Recovering with custom memtable_capacity: {} bytes", memtable_capacity);
+        let inner = TreeInner::recover_with_capacity(
+            tx_log_store,
+            listener_factory,
+            on_drop_record_in_memtable,
+            sync_id_store,
+            memtable_capacity,
         )?;
         Ok(Self(Arc::new(inner)))
     }
@@ -248,11 +288,29 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
     ) -> Result<Self> {
+        Self::format_with_capacity(
+            tx_log_store,
+            listener_factory,
+            on_drop_record_in_memtable,
+            sync_id_store,
+            MEMTABLE_CAPACITY,
+        )
+    }
+
+    pub fn format_with_capacity(
+        tx_log_store: Arc<TxLogStore<D>>,
+        listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
+        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
+        sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        memtable_capacity: usize,
+    ) -> Result<Self> {
+        #[cfg(not(feature = "linux"))]
+        info!("[TreeInner] Creating MemTableManager with capacity: {} bytes", memtable_capacity);
         let sync_id: SyncId = 0;
         Ok(Self {
             memtable_manager: MemTableManager::new(
                 sync_id,
-                MEMTABLE_CAPACITY,
+                memtable_capacity,
                 on_drop_record_in_memtable,
             ),
             sst_manager: RwLock::new(SstManager::new()),
@@ -270,6 +328,22 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
     ) -> Result<Self> {
+        Self::recover_with_capacity(
+            tx_log_store,
+            listener_factory,
+            on_drop_record_in_memtable,
+            sync_id_store,
+            MEMTABLE_CAPACITY,
+        )
+    }
+
+    pub fn recover_with_capacity(
+        tx_log_store: Arc<TxLogStore<D>>,
+        listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
+        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
+        sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        memtable_capacity: usize,
+    ) -> Result<Self> {
         let (synced_records, wal_sync_id) = Self::recover_from_wal(&tx_log_store)?;
         let (sst_manager, ssts_sync_id) = Self::recover_sst_manager(&tx_log_store)?;
 
@@ -277,10 +351,11 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         let master_sync_id = MasterSyncId::new(sync_id_store, max_sync_id)?;
         let sync_id = master_sync_id.id();
 
-        let memtable_manager = Self::recover_memtable_manager(
+        let memtable_manager = Self::recover_memtable_manager_with_capacity(
             sync_id,
             synced_records.into_iter(),
             on_drop_record_in_memtable,
+            memtable_capacity,
         );
 
         let recov_self = Self {
@@ -329,8 +404,25 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         synced_records: impl Iterator<Item = (K, V)>,
         on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
     ) -> MemTableManager<K, V> {
+        Self::recover_memtable_manager_with_capacity(
+            sync_id,
+            synced_records,
+            on_drop_record_in_memtable,
+            MEMTABLE_CAPACITY,
+        )
+    }
+
+    /// Recover `MemTable` from the given synced records with custom capacity.
+    fn recover_memtable_manager_with_capacity(
+        sync_id: SyncId,
+        synced_records: impl Iterator<Item = (K, V)>,
+        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
+        memtable_capacity: usize,
+    ) -> MemTableManager<K, V> {
+        #[cfg(not(feature = "linux"))]
+        info!("[TreeInner] Recovering MemTableManager with capacity: {} bytes", memtable_capacity);
         let memtable_manager =
-            MemTableManager::new(sync_id, MEMTABLE_CAPACITY, on_drop_record_in_memtable);
+            MemTableManager::new(sync_id, memtable_capacity, on_drop_record_in_memtable);
         synced_records.into_iter().for_each(|(k, v)| {
             let _ = memtable_manager.put(k, v);
         });

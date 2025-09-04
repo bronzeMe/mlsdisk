@@ -110,6 +110,20 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         root_key: Key,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
     ) -> Result<Self> {
+        Self::create_with_config(disk, root_key, sync_id_store, DATA_BUF_CAP, MEMTABLE_CAPACITY)
+    }
+
+    /// Creates a new `SwornDisk` on the given disk, with the root encryption key and custom configuration.
+    pub fn create_with_config(
+        disk: D,
+        root_key: Key,
+        sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        data_buf_cap: usize,
+        memtable_capacity: usize,
+    ) -> Result<Self> {
+        #[cfg(not(feature = "linux"))]
+        info!("[SwornDisk] Creating with custom config - data_buf_cap: {} blocks, memtable_capacity: {} bytes", 
+              data_buf_cap, memtable_capacity);
         let data_disk = Self::subdisk_for_data(&disk)?;
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
 
@@ -128,11 +142,12 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 // Deallocate the host block while the corresponding record is dropped in `MemTable`
                 table.set_deallocated(record.value().hba);
             };
-            TxLsmTree::format(
+            TxLsmTree::format_with_capacity(
                 tx_log_store.clone(),
                 listener_factory,
                 Some(Arc::new(on_drop_record_in_memtable)),
                 sync_id_store,
+                memtable_capacity,
             )?
         };
 
@@ -143,7 +158,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 user_data_disk: data_disk,
                 block_validity_table,
                 tx_log_store,
-                data_buf: DataBuf::new(DATA_BUF_CAP),
+                data_buf: DataBuf::new(data_buf_cap),
                 root_key,
                 is_dropped: AtomicBool::new(false),
                 write_sync_region: RwLock::new(()),
@@ -151,7 +166,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         };
 
         #[cfg(not(feature = "linux"))]
-        info!("[SwornDisk] Created successfully! {:?}", &new_self);
+        info!("[SwornDisk] Created successfully with custom config! {:?}", &new_self);
         // XXX: Would `disk::drop()` bring unexpected behavior?
         Ok(new_self)
     }
@@ -162,6 +177,20 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         root_key: Key,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
     ) -> Result<Self> {
+        Self::open_with_config(disk, root_key, sync_id_store, DATA_BUF_CAP, MEMTABLE_CAPACITY)
+    }
+
+    /// Opens the `SwornDisk` on the given disk, with the root encryption key and custom configuration.
+    pub fn open_with_config(
+        disk: D,
+        root_key: Key,
+        sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        data_buf_cap: usize,
+        memtable_capacity: usize,
+    ) -> Result<Self> {
+        #[cfg(not(feature = "linux"))]
+        info!("[SwornDisk] Opening with custom config - data_buf_cap: {} blocks, memtable_capacity: {} bytes", 
+              data_buf_cap, memtable_capacity);
         let data_disk = Self::subdisk_for_data(&disk)?;
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
 
@@ -181,11 +210,12 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 // Deallocate the host block while the corresponding record is dropped in `MemTable`
                 table.set_deallocated(record.value().hba);
             };
-            TxLsmTree::recover(
+            TxLsmTree::recover_with_capacity(
                 tx_log_store.clone(),
                 listener_factory,
                 Some(Arc::new(on_drop_record_in_memtable)),
                 sync_id_store,
+                memtable_capacity,
             )?
         };
 
@@ -195,7 +225,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 logical_block_table,
                 user_data_disk: data_disk,
                 block_validity_table,
-                data_buf: DataBuf::new(DATA_BUF_CAP),
+                data_buf: DataBuf::new(data_buf_cap),
                 tx_log_store,
                 root_key,
                 is_dropped: AtomicBool::new(false),
