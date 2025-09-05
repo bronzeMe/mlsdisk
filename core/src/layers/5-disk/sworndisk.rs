@@ -109,6 +109,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         disk: D,
         root_key: Key,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        data_buf_cap: Option<usize>,
     ) -> Result<Self> {
         let data_disk = Self::subdisk_for_data(&disk)?;
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
@@ -136,6 +137,11 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             )?
         };
 
+        // 使用提供的 data_buf_cap 或默认值
+        let buf_cap = data_buf_cap.unwrap_or(DEFAULT_DATA_BUF_CAP);
+        #[cfg(not(feature = "linux"))]
+        info!("[SwornDisk::create] Using data_buf_cap: {} blocks", buf_cap);
+
         let new_self = Self {
             inner: Arc::new(DiskInner {
                 bio_req_queue: BioReqQueue::new(),
@@ -143,7 +149,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 user_data_disk: data_disk,
                 block_validity_table,
                 tx_log_store,
-                data_buf: DataBuf::new(DATA_BUF_CAP),
+                data_buf: DataBuf::new(buf_cap),
                 root_key,
                 is_dropped: AtomicBool::new(false),
                 write_sync_region: RwLock::new(()),
@@ -161,6 +167,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         disk: D,
         root_key: Key,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        data_buf_cap: Option<usize>,
     ) -> Result<Self> {
         let data_disk = Self::subdisk_for_data(&disk)?;
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
@@ -189,13 +196,18 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             )?
         };
 
+        // 使用提供的 data_buf_cap 或默认值
+        let buf_cap = data_buf_cap.unwrap_or(DEFAULT_DATA_BUF_CAP);
+        #[cfg(not(feature = "linux"))]
+        info!("[SwornDisk::open] Using data_buf_cap: {} blocks", buf_cap);
+
         let opened_self = Self {
             inner: Arc::new(DiskInner {
                 bio_req_queue: BioReqQueue::new(),
                 logical_block_table,
                 user_data_disk: data_disk,
                 block_validity_table,
-                data_buf: DataBuf::new(DATA_BUF_CAP),
+                data_buf: DataBuf::new(buf_cap),
                 tx_log_store,
                 root_key,
                 is_dropped: AtomicBool::new(false),
@@ -236,8 +248,8 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
     }
 }
 
-/// Capacity of the user data blocks buffer.
-const DATA_BUF_CAP: usize = 1024;
+/// Default capacity of the user data blocks buffer.
+const DEFAULT_DATA_BUF_CAP: usize = 1024;
 
 impl<D: BlockSet + 'static> DiskInner<D> {
     /// Read a specified number of blocks at a logical block address on the device.
@@ -806,7 +818,7 @@ mod tests {
         let mem_disk = MemDisk::create(nblocks)?;
         let root_key = Key::random();
         // Create a new `SwornDisk` then do some writes
-        let sworndisk = SwornDisk::create(mem_disk.clone(), root_key, None)?;
+        let sworndisk = SwornDisk::create(mem_disk.clone(), root_key, None, None)?;
         let num_rw = 1024;
 
         // Submit a write block I/O request
@@ -843,7 +855,7 @@ mod tests {
         // Open the closed `SwornDisk` then test its data's existence
         drop(sworndisk);
         thread::spawn(move || -> Result<()> {
-            let opened_sworndisk = SwornDisk::open(mem_disk, root_key, None)?;
+            let opened_sworndisk = SwornDisk::open(mem_disk, root_key, None, None)?;
             let mut rbuf = Buf::alloc(2)?;
             opened_sworndisk.read(5 as Lba, rbuf.as_mut())?;
             assert_eq!(rbuf.as_slice()[0], 5u8);
