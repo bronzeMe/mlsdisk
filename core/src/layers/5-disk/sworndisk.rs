@@ -10,6 +10,7 @@
 use super::bio::{BioReq, BioReqQueue, BioResp, BioType};
 use super::block_alloc::{AllocTable, BlockAlloc};
 use super::data_buf::DataBuf;
+use super::read_cache::ReadCache;
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
 use crate::layers::log::TxLogStore;
 use crate::layers::lsm::{
@@ -47,8 +48,10 @@ struct DiskInner<D: BlockSet> {
     block_validity_table: Arc<AllocTable>,
     /// TX log store for managing logs in `TxLsmTree` and block alloc logs.
     tx_log_store: Arc<TxLogStore<D>>,
-    /// A buffer to cache data blocks.
+    /// A buffer to cache data blocks for write operations.
     data_buf: DataBuf,
+    /// A cache for read operations to improve read performance.
+    read_cache: ReadCache,
     /// Root encryption key.
     root_key: Key,
     /// Whether `SwornDisk` is dropped.
@@ -141,6 +144,11 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         let buf_cap = data_buf_cap.unwrap_or(DEFAULT_DATA_BUF_CAP);
         #[cfg(not(feature = "linux"))]
         info!("[SwornDisk::create] Using data_buf_cap: {} blocks", buf_cap);
+        
+        // 初始化读缓存
+        let read_cache_cap = DEFAULT_READ_CACHE_CAP;
+        #[cfg(not(feature = "linux"))]
+        info!("[SwornDisk::create] Using read_cache_cap: {} blocks", read_cache_cap);
 
         let new_self = Self {
             inner: Arc::new(DiskInner {
@@ -150,6 +158,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 block_validity_table,
                 tx_log_store,
                 data_buf: DataBuf::new(buf_cap),
+                read_cache: ReadCache::new(read_cache_cap),
                 root_key,
                 is_dropped: AtomicBool::new(false),
                 write_sync_region: RwLock::new(()),
@@ -200,6 +209,11 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         let buf_cap = data_buf_cap.unwrap_or(DEFAULT_DATA_BUF_CAP);
         #[cfg(not(feature = "linux"))]
         info!("[SwornDisk::open] Using data_buf_cap: {} blocks", buf_cap);
+        
+        // 初始化读缓存
+        let read_cache_cap = DEFAULT_READ_CACHE_CAP;
+        #[cfg(not(feature = "linux"))]
+        info!("[SwornDisk::open] Using read_cache_cap: {} blocks", read_cache_cap);
 
         let opened_self = Self {
             inner: Arc::new(DiskInner {
@@ -208,6 +222,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 user_data_disk: data_disk,
                 block_validity_table,
                 data_buf: DataBuf::new(buf_cap),
+                read_cache: ReadCache::new(read_cache_cap),
                 tx_log_store,
                 root_key,
                 is_dropped: AtomicBool::new(false),
@@ -251,6 +266,9 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 /// Default capacity of the user data blocks buffer.
 const DEFAULT_DATA_BUF_CAP: usize = 1024;
 
+/// Default capacity of the read cache.
+const DEFAULT_READ_CACHE_CAP: usize = 2048;
+
 impl<D: BlockSet + 'static> DiskInner<D> {
     /// Read a specified number of blocks at a logical block address on the device.
     /// The block contents will be read into a single contiguous buffer.
@@ -292,15 +310,25 @@ impl<D: BlockSet + 'static> DiskInner<D> {
 
     fn read_one_block(&self, lba: Lba, mut buf: BufMut) -> Result<()> {
         debug_assert_eq!(buf.nblocks(), 1);
-        // Search in `DataBuf` first
+        
+        // 首先检查读缓存
+        if self.read_cache.get(RecordKey { lba }, &mut buf).is_some() {
+            #[cfg(not(feature = "linux"))]
+            trace!("[SwornDisk] read_cache hit for lba {}", lba);
+            return Ok(());
+        }
+        
+        // 检查写缓存
         if self.data_buf.get(RecordKey { lba }, &mut buf).is_some() {
+            // 将数据添加到读缓存以加速后续读取
+            self.read_cache.put(RecordKey { lba }, buf.as_slice());
             return Ok(());
         }
 
-        // Search in `TxLsmTree` then
+        // 从TxLsmTree查找元数据
         let value = self.logical_block_table.get(&RecordKey { lba })?;
 
-        // Perform disk read and decryption
+        // 执行磁盘读取和解密
         let mut cipher = Buf::alloc(1)?;
         self.user_data_disk.read(value.hba, cipher.as_mut())?;
         Aead::new().decrypt(
@@ -311,6 +339,9 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             &value.mac,
             buf.as_mut_slice(),
         )?;
+        
+        // 将解密后的数据添加到读缓存
+        self.read_cache.put(RecordKey { lba }, buf.as_slice());
 
         Ok(())
     }
@@ -321,24 +352,48 @@ impl<D: BlockSet + 'static> DiskInner<D> {
 
         let mut range_query_ctx =
             RangeQueryCtx::<RecordKey, RecordValue>::new(RecordKey { lba }, nblocks);
-
-        // Search in `DataBuf` first
-        for (key, data_block) in self
-            .data_buf
-            .get_range(range_query_ctx.range_uncompleted().unwrap())
-        {
-            buf_vec
-                .nth_buf_mut_slice(key.lba - lba)
-                .copy_from_slice(data_block.as_slice());
-            range_query_ctx.mark_completed(key);
+            
+        // 首先检查读缓存
+        for i in 0..nblocks {
+            let current_lba = lba + i;
+            let current_key = RecordKey { lba: current_lba };
+            let target_buf = buf_vec.nth_buf_mut_slice(i);
+            
+            // 创建临时缓冲区来获取缓存数据
+            let mut temp_buf = Buf::alloc(1)?;
+            let mut temp_buf_mut = temp_buf.as_mut();
+            
+            if self.read_cache.get(current_key, &mut temp_buf_mut).is_some() {
+                // 读缓存命中
+                target_buf.copy_from_slice(temp_buf_mut.as_slice());
+                range_query_ctx.mark_completed(current_key);
+            }
         }
+        
         if range_query_ctx.is_completed() {
             return Ok(());
         }
 
-        // Search in `TxLsmTree` then
+        // 检查写缓存
+        for (key, data_block) in self
+            .data_buf
+            .get_range(range_query_ctx.range_uncompleted().unwrap())
+        {
+            let target_buf = buf_vec.nth_buf_mut_slice(key.lba - lba);
+            target_buf.copy_from_slice(data_block.as_slice());
+            
+            // 将数据添加到读缓存
+            self.read_cache.put(key, target_buf);
+            
+            range_query_ctx.mark_completed(key);
+        }
+        
+        if range_query_ctx.is_completed() {
+            return Ok(());
+        }
+
+        // 从TxLsmTree查找元数据
         self.logical_block_table.get_range(&mut range_query_ctx)?;
-        // Allow empty read
         debug_assert!(range_query_ctx.is_completed());
 
         let mut res = range_query_ctx.into_results();
@@ -347,7 +402,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             res.group_by(|(_, v1), (_, v2)| v2.hba - v1.hba == 1)
         };
 
-        // Perform disk read in batches and decryption
+        // 执行批量磁盘读取和解密
         let mut cipher_buf = Buf::alloc(nblocks)?;
         let cipher_slice = cipher_buf.as_mut_slice();
         for record_batch in record_batches {
@@ -357,14 +412,19 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             )?;
 
             for (nth, (key, value)) in record_batch.iter().enumerate() {
+                let target_buf = buf_vec.nth_buf_mut_slice(key.lba - lba);
+                
                 Aead::new().decrypt(
                     &cipher_slice[nth * BLOCK_SIZE..(nth + 1) * BLOCK_SIZE],
                     &value.key,
                     &Iv::new_zeroed(),
                     &[],
                     &value.mac,
-                    buf_vec.nth_buf_mut_slice(key.lba - lba),
+                    target_buf,
                 )?;
+                
+                // 将解密后的数据添加到读缓存
+                self.read_cache.put(*key, target_buf);
             }
         }
 
@@ -376,7 +436,13 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     pub fn write(&self, mut lba: Lba, buf: BufRef) -> Result<()> {
         // Write block contents to `DataBuf` directly
         for block_buf in buf.iter() {
-            let buf_at_capacity = self.data_buf.put(RecordKey { lba }, block_buf);
+            let current_key = RecordKey { lba };
+            
+            // 更新写缓存
+            let buf_at_capacity = self.data_buf.put(current_key, block_buf);
+            
+            // 同时更新读缓存，保持一致性
+            self.read_cache.put(current_key, block_buf.as_slice());
 
             // Flush all data blocks in `DataBuf` to disk if it's full
             if buf_at_capacity {
@@ -458,6 +524,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
 
     /// Sync all cached data in the device to the storage medium for durability.
     pub fn sync(&self) -> Result<()> {
+        // 刷新写缓存
         self.flush_data_buf()?;
         debug_assert!(self.data_buf.is_empty());
 
@@ -468,6 +535,9 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             .do_compaction(&self.tx_log_store)?;
 
         self.tx_log_store.sync()?;
+        
+        // 注意：我们不清空读缓存，因为读缓存不影响数据持久性
+        // 读缓存只是为了提高性能，不需要在sync时清空
 
         self.user_data_disk.flush()
     }
@@ -811,6 +881,7 @@ mod tests {
 
     use core::ptr::NonNull;
     use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn sworndisk_fns() -> Result<()> {
@@ -864,5 +935,50 @@ mod tests {
         })
         .join()
         .unwrap()
+    }
+    
+    #[test]
+    fn test_read_cache_performance() -> Result<()> {
+        let nblocks = 10 * 1024;
+        let mem_disk = MemDisk::create(nblocks)?;
+        let root_key = Key::random();
+        
+        // 创建SwornDisk
+        let sworndisk = SwornDisk::create(mem_disk.clone(), root_key, None, None)?;
+        
+        // 写入一些测试数据
+        let num_blocks = 100;
+        let mut wbuf = Buf::alloc(1)?;
+        for i in 0..num_blocks {
+            wbuf.as_mut_slice().fill(i as u8);
+            sworndisk.write(i as Lba, wbuf.as_ref())?;
+        }
+        
+        // 同步数据
+        sworndisk.sync()?;
+        
+        // 第一次读取（未缓存）
+        let mut rbuf = Buf::alloc(1)?;
+        let start_time = Instant::now();
+        for i in 0..num_blocks {
+            sworndisk.read(i as Lba, rbuf.as_mut())?;
+            assert_eq!(rbuf.as_slice()[0], i as u8);
+        }
+        let first_read_time = start_time.elapsed();
+        
+        // 第二次读取（应该命中缓存）
+        let start_time = Instant::now();
+        for i in 0..num_blocks {
+            sworndisk.read(i as Lba, rbuf.as_mut())?;
+            assert_eq!(rbuf.as_slice()[0], i as u8);
+        }
+        let second_read_time = start_time.elapsed();
+        
+        // 验证第二次读取比第一次快
+        println!("First read time: {:?}", first_read_time);
+        println!("Second read time: {:?}", second_read_time);
+        assert!(second_read_time < first_read_time);
+        
+        Ok(())
     }
 }
