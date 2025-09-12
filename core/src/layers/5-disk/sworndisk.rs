@@ -10,6 +10,7 @@
 use super::bio::{BioReq, BioReqQueue, BioResp, BioType};
 use super::block_alloc::{AllocTable, BlockAlloc};
 use super::data_buf::DataBuf;
+use super::read_cache::{ReadCacheSystem, CacheLookupResult, CacheInsertHint};
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
 use crate::layers::log::TxLogStore;
 use crate::layers::lsm::{
@@ -49,6 +50,8 @@ struct DiskInner<D: BlockSet> {
     tx_log_store: Arc<TxLogStore<D>>,
     /// A buffer to cache data blocks.
     data_buf: DataBuf,
+    /// Three-tier intelligent read cache system.
+    read_cache: Arc<ReadCacheSystem>,
     /// Root encryption key.
     root_key: Key,
     /// Whether `SwornDisk` is dropped.
@@ -104,6 +107,14 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         self.inner.user_data_disk.nblocks()
     }
 
+    /// Get read cache statistics for monitoring and optimization.
+    ///
+    /// Returns cache hit ratios, memory usage, and other performance metrics
+    /// that can be used to tune cache behavior and monitor system performance.
+    pub fn cache_stats(&self) -> super::read_cache::CacheStats {
+        self.inner.read_cache.stats()
+    }
+
     /// Creates a new `SwornDisk` on the given disk, with the root encryption key.
     pub fn create(
         disk: D,
@@ -136,6 +147,8 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             )?
         };
 
+        let read_cache = Arc::new(ReadCacheSystem::new()?);
+
         let new_self = Self {
             inner: Arc::new(DiskInner {
                 bio_req_queue: BioReqQueue::new(),
@@ -144,6 +157,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 block_validity_table,
                 tx_log_store,
                 data_buf: DataBuf::new(DATA_BUF_CAP),
+                read_cache,
                 root_key,
                 is_dropped: AtomicBool::new(false),
                 write_sync_region: RwLock::new(()),
@@ -189,6 +203,8 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             )?
         };
 
+        let read_cache = Arc::new(ReadCacheSystem::new()?);
+
         let opened_self = Self {
             inner: Arc::new(DiskInner {
                 bio_req_queue: BioReqQueue::new(),
@@ -196,6 +212,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 user_data_disk: data_disk,
                 block_validity_table,
                 data_buf: DataBuf::new(DATA_BUF_CAP),
+                read_cache,
                 tx_log_store,
                 root_key,
                 is_dropped: AtomicBool::new(false),
@@ -280,13 +297,27 @@ impl<D: BlockSet + 'static> DiskInner<D> {
 
     fn read_one_block(&self, lba: Lba, mut buf: BufMut) -> Result<()> {
         debug_assert_eq!(buf.nblocks(), 1);
-        // Search in `DataBuf` first
-        if self.data_buf.get(RecordKey { lba }, &mut buf).is_some() {
+        let key = RecordKey { lba };
+        
+        // Search in write buffer (`DataBuf`) first - highest priority
+        if self.data_buf.get(key, &mut buf).is_some() {
             return Ok(());
         }
 
-        // Search in `TxLsmTree` then
-        let value = self.logical_block_table.get(&RecordKey { lba })?;
+        // Check read cache system next
+        match self.read_cache.lookup(key) {
+            CacheLookupResult::Hit(cached_block) => {
+                // Zero-copy from cache
+                cached_block.copy_to_buf(&mut buf)?;
+                return Ok(());
+            }
+            CacheLookupResult::Miss => {
+                // Continue to disk read
+            }
+        }
+
+        // Fallback to LSM tree lookup and disk read
+        let value = self.logical_block_table.get(&key)?;
 
         // Perform disk read and decryption
         let mut cipher = Buf::alloc(1)?;
@@ -299,6 +330,17 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             &value.mac,
             buf.as_mut_slice(),
         )?;
+
+        // Cache the decrypted data for future reads
+        let cached_data: Box<[u8; BLOCK_SIZE]> = Box::new(
+            buf.as_slice().try_into().map_err(|_| {
+                Error::with_msg(InvalidArgs, "buffer size mismatch")
+            })?
+        );
+        if let Err(_) = self.read_cache.insert(key, cached_data, CacheInsertHint::Normal) {
+            #[cfg(not(feature = "linux"))]
+            warn!("[SwornDisk] Failed to insert block {} into read cache", lba);
+        }
 
         Ok(())
     }
