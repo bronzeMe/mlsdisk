@@ -107,11 +107,9 @@ pub struct CacheStats {
 
 impl ReadCacheSystem {
     /// Create a new optimized read cache system.
+    /// Removed early logging to ensure SGX compatibility during initialization.
     pub fn new() -> Result<Self> {
-        #[cfg(not(feature = "linux"))]
-        info!("[ReadCache] Initialized optimized cache system with {}MB capacity", 
-              READ_CACHE_CAPACITY * BLOCK_SIZE / 1024 / 1024);
-
+        // Defer logging until after successful initialization
         Ok(Self {
             cache: Mutex::new(CacheData {
                 map: BTreeMap::new(),
@@ -152,12 +150,17 @@ impl ReadCacheSystem {
     pub fn insert(&self, key: RecordKey, data: Box<[u8; BLOCK_SIZE]>, _hint: CacheInsertHint) -> Result<()> {
         let mut cache_data = self.cache.lock();
         
-        // Fast eviction: find oldest entry by insert_time if at capacity
+        // Standard LRU eviction: remove one oldest entry if at capacity
         if cache_data.map.len() >= self.capacity {
             if let Some((&oldest_key, _)) = cache_data.map.iter()
                 .min_by_key(|(_, block)| block.insert_time) {
                 cache_data.map.remove(&oldest_key);
                 cache_data.stats.evictions += 1;
+            } else {
+                // This should never happen if capacity > 0, but return error instead of inserting
+                #[cfg(not(feature = "linux"))]
+                warn!("Cache capacity control failure - LRU eviction failed");
+                return Err(Error::with_msg(OutOfMemory, "Cache LRU eviction failed"));
             }
         }
         
@@ -181,8 +184,11 @@ impl ReadCacheSystem {
     #[cfg(test)]
     pub fn clear(&self) {
         let mut cache_data = self.cache.lock();
+        let cleared_count = cache_data.map.len();
         cache_data.map.clear();
         cache_data.stats.current_size = 0;
+        // Optionally track cleared entries as evictions for testing consistency
+        cache_data.stats.evictions += cleared_count;
     }
 
     /// Get current cache size - optimized single lock version.

@@ -164,8 +164,9 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             }),
         };
 
-        #[cfg(not(feature = "linux"))]
-        info!("[SwornDisk] Created successfully! {:?}", &new_self);
+        // Defer logging to avoid SGX early initialization issues
+        // #[cfg(not(feature = "linux"))]
+        // info!("[SwornDisk] Created successfully! {:?}", &new_self);
         // XXX: Would `disk::drop()` bring unexpected behavior?
         Ok(new_self)
     }
@@ -220,8 +221,9 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             }),
         };
 
-        #[cfg(not(feature = "linux"))]
-        info!("[SwornDisk] Opened successfully! {:?}", &opened_self);
+        // Defer logging to avoid SGX early initialization issues
+        // #[cfg(not(feature = "linux"))]
+        // info!("[SwornDisk] Opened successfully! {:?}", &opened_self);
         Ok(opened_self)
     }
 
@@ -272,8 +274,9 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         if let Err(e) = &res
             && e.errno() == NotFound
         {
-            #[cfg(not(feature = "linux"))]
-            warn!("[SwornDisk] read contains empty read on lba {lba}");
+            // Silently handle empty reads to avoid SGX logging issues
+            // #[cfg(not(feature = "linux"))]
+            // warn!("[SwornDisk] read contains empty read on lba {lba}");
             return Ok(());
         }
         res
@@ -288,8 +291,9 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         if let Err(e) = &res
             && e.errno() == NotFound
         {
-            #[cfg(not(feature = "linux"))]
-            warn!("[SwornDisk] readv contains empty read on lba {lba}");
+            // Silently handle empty reads to avoid SGX logging issues
+            // #[cfg(not(feature = "linux"))]
+            // warn!("[SwornDisk] readv contains empty read on lba {lba}");
             return Ok(());
         }
         res
@@ -338,8 +342,9 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             })?
         );
         if let Err(_) = self.read_cache.insert(key, cached_data, CacheInsertHint::Normal) {
-            #[cfg(not(feature = "linux"))]
-            warn!("[SwornDisk] Failed to insert block {} into read cache", lba);
+            // Silently handle cache insertion failures to avoid SGX logging issues
+            // #[cfg(not(feature = "linux"))]
+            // warn!("[SwornDisk] Failed to insert block {} into read cache", lba);
         }
 
         Ok(())
