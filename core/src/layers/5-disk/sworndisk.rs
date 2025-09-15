@@ -435,6 +435,10 @@ impl<D: BlockSet + 'static> DiskInner<D> {
 
     fn flush_data_buf(&self) -> Result<()> {
         let records = self.write_blocks_from_data_buf()?;
+        
+        // Collect keys for cache invalidation
+        let invalidate_keys: Vec<RecordKey> = records.iter().map(|(key, _)| *key).collect();
+        
         // Insert new records of data blocks to `TxLsmTree`
         for (key, value) in records {
             // TODO: Error handling: Should dealloc the written blocks
@@ -442,6 +446,18 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         }
 
         self.data_buf.clear();
+        
+        // CRITICAL: Invalidate read cache entries to maintain data consistency
+        // This prevents read_cache from returning stale data after data_buf flush
+        if !invalidate_keys.is_empty() {
+            let invalidated = self.read_cache.invalidate_batch(&invalidate_keys);
+            // Silently handle cache invalidation for SGX compatibility
+            // #[cfg(not(feature = "linux"))]
+            // if invalidated > 0 {
+            //     info!("[SwornDisk] Invalidated {} read cache entries during flush", invalidated);
+            // }
+        }
+        
         Ok(())
     }
 

@@ -9,6 +9,7 @@
 //! - **Simple locks**: Use proven Mutex/BTreeMap pattern from data_buf.rs
 //! - **SGX compatible**: Use crate::os synchronization primitives
 //! - **Zero-copy reads**: Cache stores decrypted data to avoid repeated decryption
+//! - **True LRU eviction**: Authentic LRU based on last access time, not insertion time
 //! - **Write path isolation**: Read cache never interferes with write operations
 
 use super::sworndisk::{RecordKey, RecordValue};
@@ -22,9 +23,9 @@ use log::{info, warn};
 /// Read cache capacity (32MB = 8192 blocks of 4KB each)
 pub(super) const READ_CACHE_CAPACITY: usize = 8192;
 
-/// Optimized read cache system - fixes lock contention issues.
+/// True LRU read cache system - fixes lock contention and algorithm issues.
 ///
-/// Uses single-lock design to eliminate lock contention and improve performance.
+/// Uses single-lock design and authentic LRU eviction based on access time.
 #[derive(Debug)]
 pub(super) struct ReadCacheSystem {
     /// Combined cache data and stats under single lock
@@ -59,8 +60,8 @@ pub(super) struct CachedBlock {
     /// Access counter for LRU-like behavior
     access_count: usize,
     
-    /// Insertion timestamp for eviction decisions
-    insert_time: usize,
+    /// Last access timestamp for LRU eviction decisions
+    last_access_time: usize,
 }
 
 /// Cache lookup result.
@@ -120,16 +121,19 @@ impl ReadCacheSystem {
         })
     }
 
-    /// Optimized cache lookup - fixes dual lock contention and borrowing conflicts.
+    /// True LRU cache lookup - fixes dual lock contention and borrowing conflicts.
     ///
+    /// Updates last access time for accurate LRU eviction strategy.
     /// Returns cached data if found, using single lock for better performance.
     pub fn lookup(&self, key: RecordKey) -> CacheLookupResult {
         let mut cache_data = self.cache.lock();
         
         if let Some(cached_block) = cache_data.map.get_mut(&key) {
-            // Update access counter directly
+            // Update access counter and last access time for true LRU
             if let Some(block) = Arc::get_mut(cached_block) {
                 block.access_count += 1;
+                cache_data.insert_counter += 1;
+                block.last_access_time = cache_data.insert_counter;  // Use counter as timestamp
             }
             
             // Clone the cached block first to avoid borrow conflicts
@@ -144,17 +148,18 @@ impl ReadCacheSystem {
         }
     }
 
-    /// Optimized cache insertion - fixes dual lock and long-hold issues.
+    /// True LRU cache insertion - fixes dual lock and long-hold issues.
     ///
-    /// Uses smart eviction strategy and single lock for better performance.
+    /// Uses authentic LRU eviction strategy based on last access time.
+    /// Provides better performance with single lock design.
     pub fn insert(&self, key: RecordKey, data: Box<[u8; BLOCK_SIZE]>, _hint: CacheInsertHint) -> Result<()> {
         let mut cache_data = self.cache.lock();
         
-        // Standard LRU eviction: remove one oldest entry if at capacity
+        // True LRU eviction: remove least recently used entry if at capacity
         if cache_data.map.len() >= self.capacity {
-            if let Some((&oldest_key, _)) = cache_data.map.iter()
-                .min_by_key(|(_, block)| block.insert_time) {
-                cache_data.map.remove(&oldest_key);
+            if let Some((&lru_key, _)) = cache_data.map.iter()
+                .min_by_key(|(_, block)| block.last_access_time) {
+                cache_data.map.remove(&lru_key);
                 cache_data.stats.evictions += 1;
             } else {
                 // This should never happen if capacity > 0, but return error instead of inserting
@@ -200,15 +205,48 @@ impl ReadCacheSystem {
     pub fn is_empty(&self) -> bool {
         self.cache.lock().map.is_empty()
     }
+
+    /// Remove a specific key from cache to maintain data consistency.
+    /// This is critical for cache coherence when data_buf flushes to disk.
+    pub fn invalidate(&self, key: RecordKey) -> bool {
+        let mut cache_data = self.cache.lock();
+        if let Some(_) = cache_data.map.remove(&key) {
+            cache_data.stats.evictions += 1;
+            cache_data.stats.current_size = cache_data.map.len();
+            true // Key was present and removed
+        } else {
+            false // Key was not present
+        }
+    }
+
+    /// Batch invalidate multiple keys for performance.
+    /// Used when data_buf flushes multiple blocks to disk.
+    pub fn invalidate_batch(&self, keys: &[RecordKey]) -> usize {
+        let mut cache_data = self.cache.lock();
+        let mut invalidated_count = 0;
+        
+        for &key in keys {
+            if cache_data.map.remove(&key).is_some() {
+                invalidated_count += 1;
+            }
+        }
+        
+        if invalidated_count > 0 {
+            cache_data.stats.evictions += invalidated_count;
+            cache_data.stats.current_size = cache_data.map.len();
+        }
+        
+        invalidated_count
+    }
 }
 
 impl CachedBlock {
-    /// Create a new cached block with insertion timestamp.
-    fn new(data: Box<[u8; BLOCK_SIZE]>, insert_time: usize) -> Self {
+    /// Create a new cached block with initial access timestamp.
+    fn new(data: Box<[u8; BLOCK_SIZE]>, initial_access_time: usize) -> Self {
         Self {
             data,
             access_count: 1,
-            insert_time,
+            last_access_time: initial_access_time,
         }
     }
 
@@ -229,9 +267,9 @@ impl CachedBlock {
         self.access_count
     }
 
-    /// Get insertion time for debugging.
-    pub fn insert_time(&self) -> usize {
-        self.insert_time
+    /// Get last access time for debugging.
+    pub fn last_access_time(&self) -> usize {
+        self.last_access_time
     }
 }
 
@@ -440,5 +478,48 @@ mod tests {
         // Verify stats work correctly 
         let stats = cache.stats();
         assert_eq!(stats.total_hits(), 10);
+    }
+    
+    #[test]
+    fn test_cache_invalidation() {
+        // Test cache invalidation for data consistency
+        let cache = ReadCacheSystem::new().expect("Failed to create cache");
+        let key1 = RecordKey { lba: 600 };
+        let key2 = RecordKey { lba: 601 };
+        let key3 = RecordKey { lba: 602 };
+        
+        // Insert test data
+        let data1 = Box::new([11u8; BLOCK_SIZE]);
+        let data2 = Box::new([22u8; BLOCK_SIZE]);
+        let data3 = Box::new([33u8; BLOCK_SIZE]);
+        
+        cache.insert(key1, data1, CacheInsertHint::Normal).expect("Insert 1 failed");
+        cache.insert(key2, data2, CacheInsertHint::Normal).expect("Insert 2 failed");
+        cache.insert(key3, data3, CacheInsertHint::Normal).expect("Insert 3 failed");
+        
+        assert_eq!(cache.size(), 3);
+        
+        // Test single invalidation
+        let was_present = cache.invalidate(key1);
+        assert!(was_present);
+        assert_eq!(cache.size(), 2);
+        assert!(matches!(cache.lookup(key1), CacheLookupResult::Miss));
+        assert!(matches!(cache.lookup(key2), CacheLookupResult::Hit(_)));
+        
+        // Test batch invalidation
+        let keys_to_invalidate = [key2, key3];
+        let invalidated_count = cache.invalidate_batch(&keys_to_invalidate);
+        assert_eq!(invalidated_count, 2);
+        assert_eq!(cache.size(), 0);
+        assert!(matches!(cache.lookup(key2), CacheLookupResult::Miss));
+        assert!(matches!(cache.lookup(key3), CacheLookupResult::Miss));
+        
+        // Test invalidation of non-existent key
+        let was_present = cache.invalidate(RecordKey { lba: 999 });
+        assert!(!was_present);
+        
+        // Verify stats are updated correctly
+        let stats = cache.stats();
+        assert_eq!(stats.total_evictions(), 3); // 1 + 2 from invalidations
     }
 }
