@@ -128,9 +128,11 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         let block_validity_table = Arc::new(AllocTable::new(
             NonZeroUsize::new(data_disk.nblocks()).unwrap(),
         ));
+        let read_cache = Arc::new(ReadCacheSystem::new()?);
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
             block_validity_table.clone(),
+            read_cache.clone(),
         ));
 
         let logical_block_table = {
@@ -146,8 +148,6 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 sync_id_store,
             )?
         };
-
-        let read_cache = Arc::new(ReadCacheSystem::new()?);
 
         let new_self = Self {
             inner: Arc::new(DiskInner {
@@ -185,9 +185,11 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             NonZeroUsize::new(data_disk.nblocks()).unwrap(),
             &tx_log_store,
         )?);
+        let read_cache = Arc::new(ReadCacheSystem::new()?);
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
             block_validity_table.clone(),
+            read_cache.clone(),
         ));
 
         let logical_block_table = {
@@ -203,8 +205,6 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 sync_id_store,
             )?
         };
-
-        let read_cache = Arc::new(ReadCacheSystem::new()?);
 
         let opened_self = Self {
             inner: Arc::new(DiskInner {
@@ -700,11 +700,13 @@ unsafe impl<D: BlockSet> Sync for DiskInner<D> {}
 struct TxLsmTreeListenerFactory<D> {
     store: Arc<TxLogStore<D>>,
     alloc_table: Arc<AllocTable>,
+    /// CRITICAL FIX: Add read cache reference for cache invalidation during compaction
+    read_cache: Arc<ReadCacheSystem>,
 }
 
 impl<D> TxLsmTreeListenerFactory<D> {
-    fn new(store: Arc<TxLogStore<D>>, alloc_table: Arc<AllocTable>) -> Self {
-        Self { store, alloc_table }
+    fn new(store: Arc<TxLogStore<D>>, alloc_table: Arc<AllocTable>, read_cache: Arc<ReadCacheSystem>) -> Self {
+        Self { store, alloc_table, read_cache }
     }
 }
 
@@ -721,6 +723,7 @@ impl<D: BlockSet + 'static> TxEventListenerFactory<RecordKey, RecordValue>
                 self.alloc_table.clone(),
                 self.store.clone(),
             )),
+            self.read_cache.clone(),
         ))
     }
 }
@@ -729,13 +732,16 @@ impl<D: BlockSet + 'static> TxEventListenerFactory<RecordKey, RecordValue>
 struct TxLsmTreeListener<D> {
     tx_type: TxType,
     block_alloc: Arc<BlockAlloc<D>>,
+    /// CRITICAL FIX: Add read cache reference for cache invalidation during compaction
+    read_cache: Arc<ReadCacheSystem>,
 }
 
 impl<D> TxLsmTreeListener<D> {
-    fn new(tx_type: TxType, block_alloc: Arc<BlockAlloc<D>>) -> Self {
+    fn new(tx_type: TxType, block_alloc: Arc<BlockAlloc<D>>, read_cache: Arc<ReadCacheSystem>) -> Self {
         Self {
             tx_type,
             block_alloc,
+            read_cache,
         }
     }
 }
@@ -747,9 +753,11 @@ impl<D: BlockSet + 'static> TxEventListener<RecordKey, RecordValue> for TxLsmTre
             TxType::Compaction { to_level } if to_level == LsmLevel::L0 => {
                 self.block_alloc.alloc_block(record.value().hba)
             }
-            // Major Compaction TX and Migration TX do not add new records
+            // Major Compaction TX and Migration TX: invalidate cache for compacted records
             TxType::Compaction { .. } | TxType::Migration => {
-                // Do nothing
+                // CRITICAL FIX: Invalidate read cache when records are reorganized during compaction
+                // This prevents reading stale cached data that points to old physical locations
+                self.read_cache.invalidate(*record.key());
                 Ok(())
             }
         }
@@ -762,6 +770,9 @@ impl<D: BlockSet + 'static> TxEventListener<RecordKey, RecordValue> for TxLsmTre
                 unreachable!();
             }
             TxType::Compaction { .. } | TxType::Migration => {
+                // CRITICAL FIX: Invalidate read cache when old records are dropped during compaction
+                // This ensures that any cached data pointing to the old physical location is removed
+                self.read_cache.invalidate(*record.key());
                 self.block_alloc.dealloc_block(record.value().hba)
             }
         }
