@@ -17,8 +17,6 @@ use crate::layers::bio::{BufMut, BLOCK_SIZE};
 use crate::os::{BTreeMap, Mutex, Arc};
 use crate::prelude::*;
 
-#[cfg(not(feature = "linux"))]
-use log::{info, warn};
 
 /// Read cache capacity (32MB = 8192 blocks of 4KB each)
 pub(super) const READ_CACHE_CAPACITY: usize = 8192;
@@ -164,7 +162,6 @@ impl ReadCacheSystem {
             } else {
                 // This should never happen if capacity > 0, but return error instead of inserting
                 #[cfg(not(feature = "linux"))]
-                warn!("Cache capacity control failure - LRU eviction failed");
                 return Err(Error::with_msg(OutOfMemory, "Cache LRU eviction failed"));
             }
         }
