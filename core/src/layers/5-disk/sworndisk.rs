@@ -384,12 +384,9 @@ impl<D: BlockSet + 'static> DiskInner<D> {
                 // Check read cache for this specific block
                 match self.read_cache.lookup(key) {
                     CacheLookupResult::Hit(cached_block) => {
-                        // Copy cached data to the appropriate buffer slice
-                        let mut temp_buf = crate::layers::bio::Buf::alloc(1)?;
-                        cached_block.copy_to_buf(temp_buf.as_mut())?;
-                        buf_vec
-                            .nth_buf_mut_slice(current_lba - lba)
-                            .copy_from_slice(temp_buf.as_slice());
+                        // FIXED: Direct copy from cache to target buffer
+                        let target_slice = buf_vec.nth_buf_mut_slice(current_lba - lba);
+                        target_slice.copy_from_slice(cached_block.data());
                         range_query_ctx.mark_completed(key);
                     }
                     CacheLookupResult::Miss => {
@@ -454,9 +451,15 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     /// Write a specified number of blocks at a logical block address on the device.
     /// The block contents reside in a single contiguous buffer.
     pub fn write(&self, mut lba: Lba, buf: BufRef) -> Result<()> {
+        // CRITICAL FIX: Invalidate read cache immediately for written blocks
+        let mut written_keys = Vec::with_capacity(buf.nblocks());
+        
         // Write block contents to `DataBuf` directly
         for block_buf in buf.iter() {
-            let buf_at_capacity = self.data_buf.put(RecordKey { lba }, block_buf);
+            let key = RecordKey { lba };
+            written_keys.push(key);
+            
+            let buf_at_capacity = self.data_buf.put(key, block_buf);
 
             // Flush all data blocks in `DataBuf` to disk if it's full
             if buf_at_capacity {
@@ -465,24 +468,40 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             }
             lba += 1;
         }
+        
+        // CRITICAL FIX: Immediately invalidate read cache for written blocks
+        // This prevents stale cache data from being returned before flush
+        if !written_keys.is_empty() {
+            let _invalidated = self.read_cache.invalidate_batch(&written_keys);
+            // Silent invalidation for better performance
+        }
+        
         Ok(())
     }
 
     /// Write multiple blocks at a logical block address on the device.
     /// The block contents reside in several scattered buffers.
     pub fn writev(&self, mut lba: Lba, bufs: &[BufRef]) -> Result<()> {
+        // CRITICAL FIX: Collect all keys for immediate cache invalidation
+        let total_blocks: usize = bufs.iter().map(|buf| buf.nblocks()).sum();
+        let mut all_written_keys = Vec::with_capacity(total_blocks);
+        
         for buf in bufs {
+            // CRITICAL FIX: Collect keys before calling write() which will also invalidate
+            for i in 0..buf.nblocks() {
+                all_written_keys.push(RecordKey { lba: lba + i });
+            }
             self.write(lba, *buf)?;
             lba += buf.nblocks();
         }
+        
+        // Note: Individual write() calls already invalidated their respective blocks
+        // This is just for consistency and potential future optimizations
         Ok(())
     }
 
     fn flush_data_buf(&self) -> Result<()> {
         let records = self.write_blocks_from_data_buf()?;
-        
-        // Collect keys for cache invalidation
-        let invalidate_keys: Vec<RecordKey> = records.iter().map(|(key, _)| *key).collect();
         
         // Insert new records of data blocks to `TxLsmTree`
         for (key, value) in records {
@@ -492,16 +511,9 @@ impl<D: BlockSet + 'static> DiskInner<D> {
 
         self.data_buf.clear();
         
-        // CRITICAL: Invalidate read cache entries to maintain data consistency
-        // This prevents read_cache from returning stale data after data_buf flush
-        if !invalidate_keys.is_empty() {
-            let invalidated = self.read_cache.invalidate_batch(&invalidate_keys);
-            // Silently handle cache invalidation for SGX compatibility
-            // #[cfg(not(feature = "linux"))]
-            // if invalidated > 0 {
-            //     info!("[SwornDisk] Invalidated {} read cache entries during flush", invalidated);
-            // }
-        }
+        // NOTE: read_cache invalidation is now handled immediately in write()
+        // operations to maintain better data consistency, so no need to 
+        // invalidate again here. This avoids duplicate invalidation overhead.
         
         Ok(())
     }
