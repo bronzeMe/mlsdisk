@@ -17,6 +17,9 @@ use crate::layers::bio::{BufMut, BLOCK_SIZE};
 use crate::os::{BTreeMap, Mutex, Arc};
 use crate::prelude::*;
 
+#[cfg(not(feature = "linux"))]
+use log::debug;
+
 
 /// Read cache capacity (32MB = 8192 blocks of 4KB each)
 pub(super) const READ_CACHE_CAPACITY: usize = 8192;
@@ -109,10 +112,12 @@ pub struct CacheStats {
 
 impl ReadCacheSystem {
     /// Create a new optimized read cache system.
-    /// Removed early logging to ensure SGX compatibility during initialization.
     pub fn new() -> Result<Self> {
-        // Defer logging until after successful initialization
-        Ok(Self {
+        #[cfg(not(feature = "linux"))]
+        debug!("[ReadCacheSystem] Initializing with capacity {} blocks ({}MB)", 
+               READ_CACHE_CAPACITY, READ_CACHE_CAPACITY * BLOCK_SIZE / 1024 / 1024);
+        
+        let cache_system = Self {
             cache: Mutex::new(CacheData {
                 map: BTreeMap::new(),
                 access_times: BTreeMap::new(),
@@ -120,7 +125,12 @@ impl ReadCacheSystem {
                 insert_counter: 0,
             }),
             capacity: READ_CACHE_CAPACITY,
-        })
+        };
+        
+        #[cfg(not(feature = "linux"))]
+        debug!("[ReadCacheSystem] Initialization completed successfully");
+        
+        Ok(cache_system)
     }
 
     /// True LRU cache lookup - fixes dual lock contention and borrowing conflicts.
@@ -153,12 +163,18 @@ impl ReadCacheSystem {
         
         // True LRU eviction: remove least recently used entry if at capacity
         if cache_data.map.len() >= self.capacity {
+            #[cfg(not(feature = "linux"))]
+            debug!("[ReadCacheSystem] Cache at capacity {}, performing LRU eviction", self.capacity);
+            
             // Find LRU key using external access times
             if let Some((&lru_key, _)) = cache_data.access_times.iter()
                 .min_by_key(|(_, &access_time)| access_time) {
                 cache_data.map.remove(&lru_key);
                 cache_data.access_times.remove(&lru_key);
                 cache_data.stats.evictions += 1;
+                
+                #[cfg(not(feature = "linux"))]
+                debug!("[ReadCacheSystem] Evicted LRU block {}", lru_key.lba);
             } else {
                 // This should never happen if capacity > 0, but return error instead of inserting
                 #[cfg(not(feature = "linux"))]
@@ -180,7 +196,17 @@ impl ReadCacheSystem {
 
     /// Get cache statistics - optimized to avoid dual lock.
     pub fn stats(&self) -> CacheStats {
-        self.cache.lock().stats.clone()
+        let cache_data = self.cache.lock();
+        let stats = cache_data.stats.clone();
+        
+        #[cfg(not(feature = "linux"))]
+        if (stats.hits + stats.misses) % 1000 == 0 && (stats.hits + stats.misses) > 0 {
+            debug!("[ReadCacheSystem] Stats: hits={}, misses={}, hit_ratio={:.1}%, size={}/{}", 
+                   stats.hits, stats.misses, stats.hit_ratio(), 
+                   stats.current_size, READ_CACHE_CAPACITY);
+        }
+        
+        stats
     }
 
     /// Clear all cached data - optimized single lock version.
@@ -214,6 +240,10 @@ impl ReadCacheSystem {
             cache_data.access_times.remove(&key);  // Also remove from access tracking
             cache_data.stats.evictions += 1;
             cache_data.stats.current_size = cache_data.map.len();
+            
+            #[cfg(not(feature = "linux"))]
+            debug!("[ReadCacheSystem] Invalidated block {} for data consistency", key.lba);
+            
             true
         } else {
             false
@@ -236,6 +266,9 @@ impl ReadCacheSystem {
         if invalidated_count > 0 {
             cache_data.stats.evictions += invalidated_count;
             cache_data.stats.current_size = cache_data.map.len();
+            
+            #[cfg(not(feature = "linux"))]
+            debug!("[ReadCacheSystem] Batch invalidated {} blocks for data consistency", invalidated_count);
         }
         
         invalidated_count

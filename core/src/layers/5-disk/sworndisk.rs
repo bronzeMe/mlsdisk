@@ -121,20 +121,40 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         root_key: Key,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
     ) -> Result<Self> {
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk] Starting create process with {} blocks", disk.nblocks());
+        
         let data_disk = Self::subdisk_for_data(&disk)?;
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
+        
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk] Partitioned disk: data={} blocks, lsm_tree={} blocks", 
+               data_disk.nblocks(), lsm_tree_disk.nblocks());
 
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk] Formatting TxLogStore...");
         let tx_log_store = Arc::new(TxLogStore::format(lsm_tree_disk, root_key.clone())?);
+        
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk] Creating AllocTable for {} blocks...", data_disk.nblocks());
         let block_validity_table = Arc::new(AllocTable::new(
             NonZeroUsize::new(data_disk.nblocks()).unwrap(),
         ));
+        
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk] Initializing ReadCacheSystem...");
         let read_cache = Arc::new(ReadCacheSystem::new()?);
+        
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk] Creating TxLsmTreeListenerFactory...");
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
             block_validity_table.clone(),
             read_cache.clone(),
         ));
 
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk] Formatting TxLsmTree...");
         let logical_block_table = {
             let table = block_validity_table.clone();
             let on_drop_record_in_memtable = move |record: &dyn AsKV<RecordKey, RecordValue>| {
@@ -149,6 +169,8 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             )?
         };
 
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk] Assembling SwornDisk components...");
         let new_self = Self {
             inner: Arc::new(DiskInner {
                 bio_req_queue: BioReqQueue::new(),
@@ -164,9 +186,8 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             }),
         };
 
-        // Defer logging to avoid SGX early initialization issues
-        // #[cfg(not(feature = "linux"))]
-        // info!("[SwornDisk] Created successfully! {:?}", &new_self);
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk] Create completed successfully");
         // XXX: Would `disk::drop()` bring unexpected behavior?
         Ok(new_self)
     }
@@ -177,21 +198,35 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         root_key: Key,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
     ) -> Result<Self> {
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk] Starting open process with {} blocks", disk.nblocks());
+        
         let data_disk = Self::subdisk_for_data(&disk)?;
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
 
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk] Recovering TxLogStore...");
         let tx_log_store = Arc::new(TxLogStore::recover(lsm_tree_disk, root_key)?);
+        
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk] Recovering AllocTable...");
         let block_validity_table = Arc::new(AllocTable::recover(
             NonZeroUsize::new(data_disk.nblocks()).unwrap(),
             &tx_log_store,
         )?);
+        
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk] Initializing ReadCacheSystem...");
         let read_cache = Arc::new(ReadCacheSystem::new()?);
+        
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
             block_validity_table.clone(),
             read_cache.clone(),
         ));
 
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk] Recovering TxLsmTree...");
         let logical_block_table = {
             let table = block_validity_table.clone();
             let on_drop_record_in_memtable = move |record: &dyn AsKV<RecordKey, RecordValue>| {
@@ -221,9 +256,8 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             }),
         };
 
-        // Defer logging to avoid SGX early initialization issues
-        // #[cfg(not(feature = "linux"))]
-        // info!("[SwornDisk] Opened successfully! {:?}", &opened_self);
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk] Open completed successfully");
         Ok(opened_self)
     }
 
