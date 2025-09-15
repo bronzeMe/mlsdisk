@@ -371,6 +371,38 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             return Ok(());
         }
 
+        // CRITICAL FIX: Check read cache for remaining uncompleted blocks
+        if let Some(uncompleted_range) = range_query_ctx.range_uncompleted() {
+            for current_lba in uncompleted_range.start().lba..=uncompleted_range.end().lba {
+                let key = RecordKey { lba: current_lba };
+                
+                // Only check uncompleted blocks
+                if !range_query_ctx.contains_uncompleted(&key) {
+                    continue;
+                }
+                
+                // Check read cache for this specific block
+                match self.read_cache.lookup(key) {
+                    CacheLookupResult::Hit(cached_block) => {
+                        // Copy cached data to the appropriate buffer slice
+                        let mut temp_buf = crate::layers::bio::Buf::alloc(1)?;
+                        cached_block.copy_to_buf(temp_buf.as_mut())?;
+                        buf_vec
+                            .nth_buf_mut_slice(current_lba - lba)
+                            .copy_from_slice(temp_buf.as_slice());
+                        range_query_ctx.mark_completed(key);
+                    }
+                    CacheLookupResult::Miss => {
+                        // Cache miss - will be handled by LSM Tree lookup
+                    }
+                }
+            }
+        }
+        
+        if range_query_ctx.is_completed() {
+            return Ok(());
+        }
+
         // Search in `TxLsmTree` then
         self.logical_block_table.get_range(&mut range_query_ctx)?;
         // Allow empty read
@@ -392,14 +424,27 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             )?;
 
             for (nth, (key, value)) in record_batch.iter().enumerate() {
+                let buf_slice = buf_vec.nth_buf_mut_slice(key.lba - lba);
                 Aead::new().decrypt(
                     &cipher_slice[nth * BLOCK_SIZE..(nth + 1) * BLOCK_SIZE],
                     &value.key,
                     &Iv::new_zeroed(),
                     &[],
                     &value.mac,
-                    buf_vec.nth_buf_mut_slice(key.lba - lba),
+                    buf_slice,
                 )?;
+                
+                // CRITICAL FIX: Cache the decrypted data for future reads
+                let cached_data: Box<[u8; BLOCK_SIZE]> = Box::new(
+                    buf_slice.try_into().map_err(|_| {
+                        Error::with_msg(InvalidArgs, "buffer size mismatch")
+                    })?
+                );
+                if let Err(_) = self.read_cache.insert(*key, cached_data, CacheInsertHint::Normal) {
+                    // Silently handle cache insertion failures to avoid SGX logging issues
+                    // #[cfg(not(feature = "linux"))]
+                    // warn!("[SwornDisk] Failed to insert block {} into read cache", key.lba);
+                }
             }
         }
 
