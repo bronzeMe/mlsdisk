@@ -256,7 +256,11 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 }
 
 /// Capacity of the user data blocks buffer.
-const DATA_BUF_CAP: usize = 1024;
+/// CRITICAL FIX: Increased from 1024 to 8192 blocks (32MB) to handle large filesystem 
+/// formatting operations like mke2fs which can write significant amounts of metadata.
+/// This prevents data loss during frequent DataBuf flushes that could cause 
+/// inconsistencies in the LSM tree records.
+const DATA_BUF_CAP: usize = 8192;
 
 impl<D: BlockSet + 'static> DiskInner<D> {
     /// Read a specified number of blocks at a logical block address on the device.
