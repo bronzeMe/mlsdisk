@@ -41,6 +41,9 @@ struct CacheData {
     /// Main cache mapping
     map: BTreeMap<RecordKey, Arc<CachedBlock>>,
     
+    /// External access time tracking (avoids Arc::get_mut issues)
+    access_times: BTreeMap<RecordKey, usize>,
+    
     /// Integrated statistics to avoid separate lock
     stats: CacheStats,
     
@@ -114,6 +117,7 @@ impl ReadCacheSystem {
         Ok(Self {
             cache: Mutex::new(CacheData {
                 map: BTreeMap::new(),
+                access_times: BTreeMap::new(),
                 stats: CacheStats::new(),
                 insert_counter: 0,
             }),
@@ -128,18 +132,12 @@ impl ReadCacheSystem {
     pub fn lookup(&self, key: RecordKey) -> CacheLookupResult {
         let mut cache_data = self.cache.lock();
         
-        if let Some(cached_block) = cache_data.map.get_mut(&key) {
-            // Update access counter and last access time for true LRU
-            if let Some(block) = Arc::get_mut(cached_block) {
-                block.access_count += 1;
-                cache_data.insert_counter += 1;
-                block.last_access_time = cache_data.insert_counter;  // Use counter as timestamp
-            }
+        if let Some(cached_block) = cache_data.map.get(&key) {
+            // CRITICAL FIX: Use external access time tracking
+            cache_data.insert_counter += 1;
+            cache_data.access_times.insert(key, cache_data.insert_counter);
             
-            // Clone the cached block first to avoid borrow conflicts
             let result_block = cached_block.clone();
-            
-            // Now we can safely update stats
             cache_data.stats.hits += 1;
             CacheLookupResult::Hit(result_block)
         } else {
@@ -157,9 +155,11 @@ impl ReadCacheSystem {
         
         // True LRU eviction: remove least recently used entry if at capacity
         if cache_data.map.len() >= self.capacity {
-            if let Some((&lru_key, _)) = cache_data.map.iter()
-                .min_by_key(|(_, block)| block.last_access_time) {
+            // Find LRU key using external access times
+            if let Some((&lru_key, _)) = cache_data.access_times.iter()
+                .min_by_key(|(_, &access_time)| access_time) {
                 cache_data.map.remove(&lru_key);
+                cache_data.access_times.remove(&lru_key);
                 cache_data.stats.evictions += 1;
             } else {
                 // This should never happen if capacity > 0, but return error instead of inserting
@@ -169,11 +169,12 @@ impl ReadCacheSystem {
             }
         }
         
-        // Create cached block with current timestamp
+        // Create cached block and track access time
         cache_data.insert_counter += 1;
         let cached_block = Arc::new(CachedBlock::new(data, cache_data.insert_counter));
         
         cache_data.map.insert(key, cached_block);
+        cache_data.access_times.insert(key, cache_data.insert_counter);
         cache_data.stats.insertions += 1;
         cache_data.stats.current_size = cache_data.map.len();
         
@@ -191,6 +192,7 @@ impl ReadCacheSystem {
         let mut cache_data = self.cache.lock();
         let cleared_count = cache_data.map.len();
         cache_data.map.clear();
+        cache_data.access_times.clear();  // Also clear access time tracking
         cache_data.stats.current_size = 0;
         // Optionally track cleared entries as evictions for testing consistency
         cache_data.stats.evictions += cleared_count;
@@ -210,12 +212,14 @@ impl ReadCacheSystem {
     /// This is critical for cache coherence when data_buf flushes to disk.
     pub fn invalidate(&self, key: RecordKey) -> bool {
         let mut cache_data = self.cache.lock();
-        if let Some(_) = cache_data.map.remove(&key) {
+        let was_present = cache_data.map.remove(&key).is_some();
+        if was_present {
+            cache_data.access_times.remove(&key);  // Also remove from access tracking
             cache_data.stats.evictions += 1;
             cache_data.stats.current_size = cache_data.map.len();
-            true // Key was present and removed
+            true
         } else {
-            false // Key was not present
+            false
         }
     }
 
@@ -227,6 +231,7 @@ impl ReadCacheSystem {
         
         for &key in keys {
             if cache_data.map.remove(&key).is_some() {
+                cache_data.access_times.remove(&key);  // Also remove from access tracking
                 invalidated_count += 1;
             }
         }
