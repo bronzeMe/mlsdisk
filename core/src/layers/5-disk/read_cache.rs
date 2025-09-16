@@ -15,28 +15,44 @@
 
 use super::sworndisk::{RecordKey, RecordValue};
 use crate::layers::bio::{BufMut, BLOCK_SIZE};
-use crate::os::{Mutex, Arc, BTreeSet};
+use crate::os::{Mutex, Arc, BTreeSet, HashMap};
 use crate::prelude::*;
 
 #[cfg(not(feature = "linux"))]
 use log::debug;
 
-/// Read cache capacity (32MB = 8192 blocks of 4KB each)
-pub(super) const READ_CACHE_CAPACITY: usize = 8192;
+/// Read cache capacity inspired by SEFS BlockCache design
+/// 
+/// SEFS analysis shows linear search becomes problematic with too many slots.
+/// We use a hybrid approach: reasonable slot count + hash index for O(1) lookup.
+/// 
+/// - Original SEFS: ~64-256 slots, O(n) linear search ✅
+/// - Our problem: 8192 slots, O(n) linear search ❌ (128x slower)
+/// - Our solution: 512 slots + HashMap index, O(1) lookup ✅
+pub(super) const READ_CACHE_CAPACITY: usize = 512;
 
 /// High-performance read cache system inspired by SEFS BlockCache design.
 ///
+/// Hybrid approach combining SEFS's proven design patterns with O(1) lookup optimization:
+/// - **SEFS-inspired structure**: Independent slot mutexes, try_lock pattern, efficient LRU
+/// - **Performance enhancement**: HashMap index eliminates O(n) linear search bottleneck
+/// - **Balanced capacity**: 512 slots (2MB) provides good hit rate without excessive memory
+///
 /// Key optimizations:
-/// - Fine-grained locking: Each cache slot has independent mutex
-/// - Non-blocking lookups: Uses try_lock to avoid waiting
-/// - Efficient LRU: Array-based implementation with O(1) operations
-/// - Pre-allocated cache slots: No runtime memory allocation overhead
+/// - Fine-grained locking: Each cache slot has independent mutex (from SEFS)
+/// - O(1) lookups: HashMap index for instant key-to-slot mapping
+/// - Non-blocking approach: Uses try_lock to avoid waiting (from SEFS)
+/// - Efficient LRU: Array-based implementation with O(1) operations (from SEFS)
+/// - Pre-allocated cache slots: No runtime memory allocation overhead (from SEFS)
 #[derive(Debug)]
 pub(super) struct ReadCacheSystem {
-    /// Pre-allocated cache slots, each with independent lock
+    /// Pre-allocated cache slots, each with independent lock (SEFS-inspired)
     cache_slots: Vec<Mutex<CacheSlot>>,
     
-    /// LRU management with efficient array-based implementation
+    /// O(1) key-to-slot-index mapping (performance enhancement over SEFS)
+    key_index: Mutex<HashMap<RecordKey, usize>>,
+    
+    /// LRU management with efficient array-based implementation (SEFS-inspired)
     lru_manager: Mutex<LRUManager>,
     
     /// Global cache statistics
@@ -164,6 +180,7 @@ impl ReadCacheSystem {
         
         let cache_system = Self {
             cache_slots,
+            key_index: Mutex::new(HashMap::new()),
             lru_manager,
             stats: Mutex::new(CacheStats::new()),
             capacity: READ_CACHE_CAPACITY,
@@ -182,28 +199,47 @@ impl ReadCacheSystem {
     pub fn lookup_and_copy(&self, key: RecordKey, buf: &mut BufMut) -> CacheLookupResult {
         debug_assert_eq!(buf.nblocks(), 1);
         
-        // Fast non-blocking search through cache slots (inspired by SEFS _get_buf)
-        for (slot_idx, slot_mutex) in self.cache_slots.iter().enumerate() {
-            if let Some(slot) = slot_mutex.try_lock() {
-                match slot.status {
-                    SlotStatus::Valid(cached_key) if cached_key == key => {
-                        // Cache hit! Direct copy to target buffer (single copy)
-                        buf.as_mut_slice().copy_from_slice(&slot.data[..]);
-                        
-                        // Update LRU and stats (after copy to minimize lock time)
-                        drop(slot); // Release slot lock immediately
-                        self.update_lru_on_hit(slot_idx);
-                        self.stats.lock().hits += 1;
-                        
-                        return CacheLookupResult::Hit;
-                    }
-                    _ => continue,
+        // PERFORMANCE BREAKTHROUGH: O(1) HashMap lookup (inspired by SEFS but optimized)
+        let slot_idx = {
+            if let Some(key_index) = self.key_index.try_lock() {
+                if let Some(&slot_idx) = key_index.get(&key) {
+                    slot_idx
+                } else {
+                    // Cache miss - key not in index
+                    drop(key_index);
+                    self.stats.lock().misses += 1;
+                    return CacheLookupResult::Miss;
+                }
+            } else {
+                // Key index temporarily locked, treat as cache miss (SEFS-inspired non-blocking)
+                self.stats.lock().misses += 1;
+                return CacheLookupResult::Miss;
+            }
+        };
+        
+        // Direct slot access with SEFS-inspired try_lock pattern
+        if let Some(slot) = self.cache_slots[slot_idx].try_lock() {
+            match slot.status {
+                SlotStatus::Valid(cached_key) if cached_key == key => {
+                    // Cache hit! Direct copy to target buffer (single copy optimization)
+                    buf.as_mut_slice().copy_from_slice(&slot.data[..]);
+                    
+                    // Update LRU and stats (after copy to minimize lock time)
+                    drop(slot); // Release slot lock immediately (SEFS pattern)
+                    self.update_lru_on_hit(slot_idx);
+                    self.stats.lock().hits += 1;
+                    
+                    return CacheLookupResult::Hit;
+                }
+                _ => {
+                    // Slot state inconsistent with index (rare edge case)
+                    self.stats.lock().misses += 1;
+                    return CacheLookupResult::Miss;
                 }
             }
-            // If slot is locked, continue searching (non-blocking approach)
         }
         
-        // Cache miss
+        // Slot temporarily locked, treat as cache miss (SEFS-inspired non-blocking)
         self.stats.lock().misses += 1;
         CacheLookupResult::Miss
     }
@@ -214,27 +250,47 @@ impl ReadCacheSystem {
     pub fn lookup_and_copy_to_slice(&self, key: RecordKey, target_slice: &mut [u8]) -> CacheLookupResult {
         debug_assert_eq!(target_slice.len(), BLOCK_SIZE);
         
-        // Fast non-blocking search through cache slots
-        for (slot_idx, slot_mutex) in self.cache_slots.iter().enumerate() {
-            if let Some(slot) = slot_mutex.try_lock() {
-                match slot.status {
-                    SlotStatus::Valid(cached_key) if cached_key == key => {
-                        // Cache hit! Direct copy to target slice (single copy)
-                        target_slice.copy_from_slice(&slot.data[..]);
-                        
-                        // Update LRU and stats (after copy to minimize lock time)
-                        drop(slot); // Release slot lock immediately
-                        self.update_lru_on_hit(slot_idx);
-                        self.stats.lock().hits += 1;
-                        
-                        return CacheLookupResult::Hit;
-                    }
-                    _ => continue,
+        // PERFORMANCE BREAKTHROUGH: O(1) HashMap lookup (inspired by SEFS but optimized)
+        let slot_idx = {
+            if let Some(key_index) = self.key_index.try_lock() {
+                if let Some(&slot_idx) = key_index.get(&key) {
+                    slot_idx
+                } else {
+                    // Cache miss - key not in index
+                    drop(key_index);
+                    self.stats.lock().misses += 1;
+                    return CacheLookupResult::Miss;
+                }
+            } else {
+                // Key index temporarily locked, treat as cache miss (SEFS-inspired non-blocking)
+                self.stats.lock().misses += 1;
+                return CacheLookupResult::Miss;
+            }
+        };
+        
+        // Direct slot access with SEFS-inspired try_lock pattern
+        if let Some(slot) = self.cache_slots[slot_idx].try_lock() {
+            match slot.status {
+                SlotStatus::Valid(cached_key) if cached_key == key => {
+                    // Cache hit! Direct copy to target slice (single copy optimization)
+                    target_slice.copy_from_slice(&slot.data[..]);
+                    
+                    // Update LRU and stats (after copy to minimize lock time)
+                    drop(slot); // Release slot lock immediately (SEFS pattern)
+                    self.update_lru_on_hit(slot_idx);
+                    self.stats.lock().hits += 1;
+                    
+                    return CacheLookupResult::Hit;
+                }
+                _ => {
+                    // Slot state inconsistent with index (rare edge case)
+                    self.stats.lock().misses += 1;
+                    return CacheLookupResult::Miss;
                 }
             }
         }
         
-        // Cache miss
+        // Slot temporarily locked, treat as cache miss (SEFS-inspired non-blocking)
         self.stats.lock().misses += 1;
         CacheLookupResult::Miss
     }
@@ -301,14 +357,39 @@ impl ReadCacheSystem {
         Ok(victim_idx)
     }
     
-    /// Insert data into specific slot
+    /// Insert data into specific slot with SEFS-inspired design + HashMap index maintenance
     fn insert_into_slot(&self, slot_idx: usize, key: RecordKey, data: Box<[u8; BLOCK_SIZE]>) {
+        // First, handle eviction of old key from HashMap index (inspired by SEFS eviction logic)
+        let old_key = {
+            if let Some(slot) = self.cache_slots[slot_idx].try_lock() {
+                match slot.status {
+                    SlotStatus::Valid(old_key) => Some(old_key),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        };
+        
+        // Remove old key from index before slot update (maintain consistency)
+        if let Some(old_key) = old_key {
+            if let Some(mut key_index) = self.key_index.try_lock() {
+                key_index.remove(&old_key);
+            }
+        }
+        
+        // Update slot data (SEFS-inspired slot management)
         if let Some(mut slot) = self.cache_slots[slot_idx].try_lock() {
             slot.status = SlotStatus::Valid(key);
             *slot.data = *data;
         }
         
-        // Update LRU state
+        // Add new key to HashMap index (performance enhancement over SEFS)
+        if let Some(mut key_index) = self.key_index.try_lock() {
+            key_index.insert(key, slot_idx);
+        }
+        
+        // Update LRU state (SEFS-inspired LRU management)
         if let Some(mut lru) = self.lru_manager.try_lock() {
             lru.access_counter += 1;
             lru.last_access[slot_idx] = lru.access_counter;
@@ -362,7 +443,12 @@ impl ReadCacheSystem {
     pub fn clear(&self) {
         let mut cleared_count = 0;
         
-        // Clear all cache slots
+        // Clear HashMap index first (performance enhancement)
+        if let Some(mut key_index) = self.key_index.try_lock() {
+            key_index.clear();
+        }
+        
+        // Clear all cache slots (SEFS-inspired slot management)
         for slot_mutex in &self.cache_slots {
             if let Some(mut slot) = slot_mutex.try_lock() {
                 if matches!(slot.status, SlotStatus::Valid(_)) {
@@ -372,7 +458,7 @@ impl ReadCacheSystem {
             }
         }
         
-        // Reset LRU state
+        // Reset LRU state (SEFS-inspired LRU management)
         if let Some(mut lru) = self.lru_manager.try_lock() {
             *lru = LRUManager::new(self.capacity);
         }
@@ -397,29 +483,69 @@ impl ReadCacheSystem {
     /// High-performance cache invalidation for data consistency.
     /// Uses non-blocking approach to minimize performance impact.
     pub fn invalidate(&self, key: RecordKey) -> bool {
-        // Search through cache slots and invalidate matching entries
-        for (slot_idx, slot_mutex) in self.cache_slots.iter().enumerate() {
-            if let Some(mut slot) = slot_mutex.try_lock() {
-                if let SlotStatus::Valid(cached_key) = slot.status {
-                    if cached_key == key {
-                        slot.status = SlotStatus::Unused;
-                        
-                        // Update statistics
-                        if let Some(mut stats) = self.stats.try_lock() {
-                            stats.evictions += 1;
-                            stats.current_size = stats.current_size.saturating_sub(1);
+        // PERFORMANCE BREAKTHROUGH: O(1) HashMap lookup for invalidation (enhancement over SEFS)
+        let slot_idx = {
+            if let Some(mut key_index) = self.key_index.try_lock() {
+                if let Some(&slot_idx) = key_index.get(&key) {
+                    // Remove from index immediately
+                    key_index.remove(&key);
+                    slot_idx
+                } else {
+                    // Key not in cache
+                    return false;
+                }
+            } else {
+                // Index locked, use SEFS-style linear search as fallback
+                for (slot_idx, slot_mutex) in self.cache_slots.iter().enumerate() {
+                    if let Some(mut slot) = slot_mutex.try_lock() {
+                        if let SlotStatus::Valid(cached_key) = slot.status {
+                            if cached_key == key {
+                                slot.status = SlotStatus::Unused;
+                                
+                                // Update statistics
+                                if let Some(mut stats) = self.stats.try_lock() {
+                                    stats.evictions += 1;
+                                    stats.current_size = stats.current_size.saturating_sub(1);
+                                }
+                                
+                                // Update LRU state
+                                if let Some(mut lru) = self.lru_manager.try_lock() {
+                                    lru.invalidate_slot(slot_idx);
+                                }
+                                
+                                #[cfg(not(feature = "linux"))]
+                                debug!("[ReadCacheSystem] Invalidated block {} (fallback search)", key.lba);
+                                
+                                return true;
+                            }
                         }
-                        
-                        // Update LRU state
-                        if let Some(mut lru) = self.lru_manager.try_lock() {
-                            lru.invalidate_slot(slot_idx);
-                        }
+                    }
+                }
+                return false;
+            }
+        };
+        
+        // Invalidate the specific slot (SEFS-inspired slot management)
+        if let Some(mut slot) = self.cache_slots[slot_idx].try_lock() {
+            if let SlotStatus::Valid(cached_key) = slot.status {
+                if cached_key == key {
+                    slot.status = SlotStatus::Unused;
+                    
+                    // Update statistics
+                    if let Some(mut stats) = self.stats.try_lock() {
+                        stats.evictions += 1;
+                        stats.current_size = stats.current_size.saturating_sub(1);
+                    }
+                    
+                    // Update LRU state
+                    if let Some(mut lru) = self.lru_manager.try_lock() {
+                        lru.invalidate_slot(slot_idx);
+                    }
             
             #[cfg(not(feature = "linux"))]
             debug!("[ReadCacheSystem] Invalidated block {} for data consistency", key.lba);
             
-                        return true;
-                    }
+                    return true;
                 }
             }
         }
@@ -431,20 +557,51 @@ impl ReadCacheSystem {
     pub fn invalidate_batch(&self, keys: &[RecordKey]) -> usize {
         let mut invalidated_count = 0;
         
-        // Build a set for efficient lookup (using BTreeSet for SGX compatibility)
-        let key_set: BTreeSet<RecordKey> = keys.iter().cloned().collect();
-        
-        // Search through all slots and invalidate matching entries
-        for (slot_idx, slot_mutex) in self.cache_slots.iter().enumerate() {
-            if let Some(mut slot) = slot_mutex.try_lock() {
-                if let SlotStatus::Valid(cached_key) = slot.status {
-                    if key_set.contains(&cached_key) {
-                        slot.status = SlotStatus::Unused;
-                invalidated_count += 1;
-                        
-                        // Update LRU state
-                        if let Some(mut lru) = self.lru_manager.try_lock() {
-                            lru.invalidate_slot(slot_idx);
+        // PERFORMANCE BREAKTHROUGH: O(k) HashMap lookups for batch invalidation
+        if let Some(mut key_index) = self.key_index.try_lock() {
+            let mut slots_to_invalidate = Vec::with_capacity(keys.len());
+            
+            // Collect slot indices and remove from index (O(k) operations)
+            for &key in keys {
+                if let Some(&slot_idx) = key_index.get(&key) {
+                    slots_to_invalidate.push((slot_idx, key));
+                    key_index.remove(&key);
+                }
+            }
+            
+            drop(key_index); // Release index lock early
+            
+            // Invalidate collected slots (SEFS-inspired slot management)
+            for (slot_idx, key) in slots_to_invalidate {
+                if let Some(mut slot) = self.cache_slots[slot_idx].try_lock() {
+                    if let SlotStatus::Valid(cached_key) = slot.status {
+                        if cached_key == key {
+                            slot.status = SlotStatus::Unused;
+                            invalidated_count += 1;
+                            
+                            // Update LRU state
+                            if let Some(mut lru) = self.lru_manager.try_lock() {
+                                lru.invalidate_slot(slot_idx);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Fallback to SEFS-style linear search if index is locked
+            let key_set: BTreeSet<RecordKey> = keys.iter().cloned().collect();
+            
+            for (slot_idx, slot_mutex) in self.cache_slots.iter().enumerate() {
+                if let Some(mut slot) = slot_mutex.try_lock() {
+                    if let SlotStatus::Valid(cached_key) = slot.status {
+                        if key_set.contains(&cached_key) {
+                            slot.status = SlotStatus::Unused;
+                            invalidated_count += 1;
+                            
+                            // Update LRU state
+                            if let Some(mut lru) = self.lru_manager.try_lock() {
+                                lru.invalidate_slot(slot_idx);
+                            }
                         }
                     }
                 }
