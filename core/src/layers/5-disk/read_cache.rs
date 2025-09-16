@@ -140,14 +140,16 @@ impl ReadCacheSystem {
     pub fn lookup(&self, key: RecordKey) -> CacheLookupResult {
         let mut cache_data = self.cache.lock();
         
-        if let Some(cached_block) = cache_data.map.get(&key) {
-            // CRITICAL FIX: Use external access time tracking
+        // CRITICAL FIX: Separate the lookup from the mutation to avoid borrowing conflicts
+        let cached_block_opt = cache_data.map.get(&key).cloned();
+        
+        if let Some(cached_block) = cached_block_opt {
+            // Now we can safely mutate without holding the immutable borrow
             cache_data.insert_counter += 1;
-            cache_data.access_times.insert(key, cache_data.insert_counter);
-            
-            let result_block = cached_block.clone();
+            let access_time = cache_data.insert_counter; // Save value to avoid borrow conflict
+            cache_data.access_times.insert(key, access_time);
             cache_data.stats.hits += 1;
-            CacheLookupResult::Hit(result_block)
+            CacheLookupResult::Hit(cached_block)
         } else {
             cache_data.stats.misses += 1;
             CacheLookupResult::Miss
@@ -184,10 +186,11 @@ impl ReadCacheSystem {
         
         // Create cached block and track access time
         cache_data.insert_counter += 1;
-        let cached_block = Arc::new(CachedBlock::new(data, cache_data.insert_counter));
+        let access_time = cache_data.insert_counter; // Save value to avoid borrow conflict
+        let cached_block = Arc::new(CachedBlock::new(data, access_time));
         
         cache_data.map.insert(key, cached_block);
-        cache_data.access_times.insert(key, cache_data.insert_counter);
+        cache_data.access_times.insert(key, access_time);
         cache_data.stats.insertions += 1;
         cache_data.stats.current_size = cache_data.map.len();
         
