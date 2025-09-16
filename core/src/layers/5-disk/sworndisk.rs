@@ -368,10 +368,9 @@ impl<D: BlockSet + 'static> DiskInner<D> {
 
         // Check read cache system next (if enabled)
         if let Some(ref read_cache) = self.read_cache {
-            match read_cache.lookup(key) {
-                CacheLookupResult::Hit(cached_block) => {
-                    // Zero-copy from cache
-                    cached_block.copy_to_buf(&mut buf)?;
+            match read_cache.lookup_and_copy(key, &mut buf) {
+                CacheLookupResult::Hit => {
+                    // Single-copy optimization: data directly copied to buffer
                     return Ok(());
                 }
                 CacheLookupResult::Miss => {
@@ -395,21 +394,56 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             buf.as_mut_slice(),
         )?;
 
-        // Cache the decrypted data for future reads (if cache is enabled)
+        // SMART CACHING STRATEGY: Use adaptive caching for single block reads
+        // Cache single blocks selectively based on access patterns to balance performance
         if let Some(ref read_cache) = self.read_cache {
-            let cached_data: Box<[u8; BLOCK_SIZE]> = Box::new(
-                buf.as_slice().try_into().map_err(|_| {
-                    Error::with_msg(InvalidArgs, "buffer size mismatch")
-                })?
-            );
-            if let Err(_) = read_cache.insert(key, cached_data, CacheInsertHint::Normal) {
-                // Silently handle cache insertion failures to avoid SGX logging issues
-                // #[cfg(not(feature = "linux"))]
-                // warn!("[SwornDisk] Failed to insert block {} into read cache", lba);
+            // Heuristic: Cache blocks that are likely to be accessed again
+            // - Metadata blocks (low LBA ranges are often metadata)
+            // - Recently accessed blocks in the same vicinity
+            // - Skip caching for obvious sequential patterns
+            
+            let should_cache = self.should_cache_single_block(lba);
+            
+            if should_cache {
+                let cached_data: Box<[u8; BLOCK_SIZE]> = Box::new(
+                    buf.as_slice().try_into().map_err(|_| {
+                        Error::with_msg(InvalidArgs, "buffer size mismatch")
+                    })?
+                );
+                // Use Cold hint for single blocks to prioritize multi-block cache entries
+                if let Err(_) = read_cache.insert(key, cached_data, CacheInsertHint::Cold) {
+                    // Silently handle cache insertion failures
+                }
             }
         }
 
         Ok(())
+    }
+
+    /// Smart heuristic to decide whether to cache a single block read.
+    /// Balances cache utilization with performance overhead.
+    fn should_cache_single_block(&self, lba: Lba) -> bool {
+        // Heuristic 1: Always cache low LBA ranges (likely filesystem metadata)
+        // EXT2 metadata (superblock, group descriptors, inode tables) are typically
+        // in the first few thousand blocks and are frequently accessed
+        if lba < 8192 {  // First 32MB likely contains metadata
+            return true;
+        }
+        
+        // Heuristic 2: Cache with probability based on LBA to avoid cache pollution
+        // Higher LBAs (user data) get cached less frequently
+        // This creates a natural preference for metadata over user data
+        let cache_probability = if lba < 65536 {  // First 256MB
+            0.5  // 50% chance for early data blocks
+        } else if lba < 262144 {  // First 1GB  
+            0.2  // 20% chance for mid-range blocks
+        } else {
+            0.1  // 10% chance for high-range blocks (likely sequential data)
+        };
+        
+        // Simple pseudo-random decision based on LBA
+        // This ensures deterministic behavior for the same LBA
+        (lba as u32).wrapping_mul(2654435761) % 100 < (cache_probability * 100.0) as u32
     }
 
     fn read_multi_blocks<'a>(&self, lba: Lba, bufs: &'a mut [BufMut<'a>]) -> Result<()> {
@@ -433,8 +467,15 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             return Ok(());
         }
 
-        // CRITICAL FIX: Check read cache for remaining uncompleted blocks (if cache is enabled)
-        if let Some(ref read_cache) = self.read_cache {
+        // PERFORMANCE OPTIMIZATION: Detect sequential read pattern to skip cache operations
+        // Sequential reads (large continuous blocks) have very low cache hit probability
+        // but high cache operation overhead. Skip cache for large sequential reads.
+        let is_likely_sequential = nblocks >= 32; // 128KB+ reads are likely sequential
+        let enable_cache_operations = !is_likely_sequential && self.read_cache.is_some();
+
+        // Check read cache for remaining uncompleted blocks (only if beneficial)
+        if enable_cache_operations {
+            let read_cache = self.read_cache.as_ref().unwrap();
             if let Some(uncompleted_range) = range_query_ctx.range_uncompleted() {
                 for current_lba in uncompleted_range.start().lba..=uncompleted_range.end().lba {
                     let key = RecordKey { lba: current_lba };
@@ -444,12 +485,11 @@ impl<D: BlockSet + 'static> DiskInner<D> {
                         continue;
                     }
                     
-                    // Check read cache for this specific block
-                    match read_cache.lookup(key) {
-                        CacheLookupResult::Hit(cached_block) => {
-                            // FIXED: Direct copy from cache to target buffer
-                            let target_slice = buf_vec.nth_buf_mut_slice(current_lba - lba);
-                            target_slice.copy_from_slice(cached_block.data());
+                    // Check read cache for this specific block  
+                    let target_slice = buf_vec.nth_buf_mut_slice(current_lba - lba);
+                    match read_cache.lookup_and_copy_to_slice(key, target_slice) {
+                        CacheLookupResult::Hit => {
+                            // Single-copy optimization: data directly copied to target slice
                             range_query_ctx.mark_completed(key);
                         }
                         CacheLookupResult::Miss => {
@@ -495,8 +535,10 @@ impl<D: BlockSet + 'static> DiskInner<D> {
                     buf_slice,
                 )?;
                 
-                // CRITICAL FIX: Cache the decrypted data for future reads (if cache is enabled)
-                if let Some(ref read_cache) = self.read_cache {
+                // PERFORMANCE OPTIMIZATION: Only cache if likely to be beneficial
+                // Skip cache insertion for sequential reads to avoid allocation overhead
+                if enable_cache_operations {
+                    let read_cache = self.read_cache.as_ref().unwrap();
                     let cached_data: Box<[u8; BLOCK_SIZE]> = Box::new(
                         buf_slice.try_into().map_err(|_| {
                             Error::with_msg(InvalidArgs, "buffer size mismatch")

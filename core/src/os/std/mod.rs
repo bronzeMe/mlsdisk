@@ -24,7 +24,7 @@ pub use alloc::{
 /// Reuse implementations of `hashbrown` crate.
 pub use hashbrown::{HashMap, HashSet};
 
-pub use alloc::collections::BTreeMap;
+pub use alloc::collections::{BTreeMap, BTreeSet};
 
 /// Reuse the `Mutex` and `MutexGuard` implementation.
 pub use spin::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
