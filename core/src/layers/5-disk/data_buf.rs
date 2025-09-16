@@ -61,45 +61,19 @@ impl DataBuf {
     pub fn put(&self, key: RecordKey, buf: BufRef) -> bool {
         debug_assert_eq!(buf.nblocks(), 1);
 
-        // CRITICAL FIX: Reorganize locking to prevent deadlock
-        loop {
-            // ①Check if buffer is full without holding locks for long
-            {
-                let is_full_guard = self.is_full.lock().unwrap();
-                if !*is_full_guard {
-                    // Buffer not full, proceed to insert
-                    break;
-                }
-            } // Release is_full lock before waiting
-            
-            // ②Wait for buffer to become available
-            let mut is_full = self.is_full.lock().unwrap();
-            while *is_full {
-                is_full = self.cvar.wait(is_full).unwrap();
-            }
-            // Loop back to check again
-        }
-
-        // ③Now safely acquire both locks in consistent order
-        let mut data_buf = self.buf.lock();
         let mut is_full = self.is_full.lock().unwrap();
-        
-        // ④Double-check capacity after acquiring locks
+        while *is_full {
+            is_full = self.cvar.wait(is_full).unwrap();
+        }
+        debug_assert!(!*is_full);
+
+        let mut data_buf = self.buf.lock();
+        let _ = data_buf.insert(key, DataBlock::from_buf(buf));
+
         if data_buf.len() >= self.cap {
             *is_full = true;
-            return true;
         }
-        
-        // ⑤Insert data block
-        let _ = data_buf.insert(key, DataBlock::from_buf(buf));
-        let buffer_full = data_buf.len() >= self.cap;
-        
-        // ⑥Update full status
-        if buffer_full {
-            *is_full = true;
-        }
-        
-        buffer_full
+        *is_full
     }
 
     /// Return the number of data blocks of the buffer.
@@ -119,15 +93,11 @@ impl DataBuf {
 
     /// Empty the buffer.
     pub fn clear(&self) {
-        // CRITICAL FIX: Use consistent lock order to prevent deadlock
-        let mut data_buf = self.buf.lock();              // ①First acquire buf lock
-        let mut is_full = self.is_full.lock().unwrap();  // ②Then acquire is_full lock
-        
-        data_buf.clear();                                // ③Clear the buffer
-        
+        let mut is_full = self.is_full.lock().unwrap();
+        self.buf.lock().clear();
         if *is_full {
-            *is_full = false;                            // ④Update full status
-            self.cvar.notify_all();                      // ⑤Notify waiting threads
+            *is_full = false;
+            self.cvar.notify_all();
         }
     }
 
