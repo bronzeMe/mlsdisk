@@ -383,6 +383,12 @@ impl Clone for CacheStats {
     }
 }
 
+impl Default for CacheStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

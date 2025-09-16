@@ -50,8 +50,8 @@ struct DiskInner<D: BlockSet> {
     tx_log_store: Arc<TxLogStore<D>>,
     /// A buffer to cache data blocks.
     data_buf: DataBuf,
-    /// Three-tier intelligent read cache system.
-    read_cache: Arc<ReadCacheSystem>,
+    /// Optional three-tier intelligent read cache system.
+    read_cache: Option<Arc<ReadCacheSystem>>,
     /// Root encryption key.
     root_key: Key,
     /// Whether `SwornDisk` is dropped.
@@ -111,8 +111,14 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
     ///
     /// Returns cache hit ratios, memory usage, and other performance metrics
     /// that can be used to tune cache behavior and monitor system performance.
+    /// If read cache is disabled, returns default (empty) statistics.
     pub fn cache_stats(&self) -> super::read_cache::CacheStats {
-        self.inner.read_cache.stats()
+        if let Some(ref read_cache) = self.inner.read_cache {
+            read_cache.stats()
+        } else {
+            // Return default empty stats when cache is disabled
+            super::read_cache::CacheStats::default()
+        }
     }
 
     /// Creates a new `SwornDisk` on the given disk, with the root encryption key.
@@ -120,6 +126,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         disk: D,
         root_key: Key,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        enable_read_cache: bool,
     ) -> Result<Self> {
         #[cfg(not(feature = "linux"))]
         debug!("[SwornDisk] Starting create process with {} blocks", disk.nblocks());
@@ -141,9 +148,15 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             NonZeroUsize::new(data_disk.nblocks()).unwrap(),
         ));
         
-        #[cfg(not(feature = "linux"))]
-        debug!("[SwornDisk] Initializing ReadCacheSystem...");
-        let read_cache = Arc::new(ReadCacheSystem::new()?);
+        let read_cache = if enable_read_cache {
+            #[cfg(not(feature = "linux"))]
+            debug!("[SwornDisk] Initializing ReadCacheSystem...");
+            Some(Arc::new(ReadCacheSystem::new()?))
+        } else {
+            #[cfg(not(feature = "linux"))]
+            debug!("[SwornDisk] ReadCacheSystem disabled");
+            None
+        };
         
         #[cfg(not(feature = "linux"))]
         debug!("[SwornDisk] Creating TxLsmTreeListenerFactory...");
@@ -197,6 +210,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         disk: D,
         root_key: Key,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        enable_read_cache: bool,
     ) -> Result<Self> {
         #[cfg(not(feature = "linux"))]
         debug!("[SwornDisk] Starting open process with {} blocks", disk.nblocks());
@@ -215,9 +229,15 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             &tx_log_store,
         )?);
         
-        #[cfg(not(feature = "linux"))]
-        debug!("[SwornDisk] Initializing ReadCacheSystem...");
-        let read_cache = Arc::new(ReadCacheSystem::new()?);
+        let read_cache = if enable_read_cache {
+            #[cfg(not(feature = "linux"))]
+            debug!("[SwornDisk] Initializing ReadCacheSystem...");
+            Some(Arc::new(ReadCacheSystem::new()?))
+        } else {
+            #[cfg(not(feature = "linux"))]
+            debug!("[SwornDisk] ReadCacheSystem disabled");
+            None
+        };
         
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
@@ -346,15 +366,17 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             return Ok(());
         }
 
-        // Check read cache system next
-        match self.read_cache.lookup(key) {
-            CacheLookupResult::Hit(cached_block) => {
-                // Zero-copy from cache
-                cached_block.copy_to_buf(&mut buf)?;
-                return Ok(());
-            }
-            CacheLookupResult::Miss => {
-                // Continue to disk read
+        // Check read cache system next (if enabled)
+        if let Some(ref read_cache) = self.read_cache {
+            match read_cache.lookup(key) {
+                CacheLookupResult::Hit(cached_block) => {
+                    // Zero-copy from cache
+                    cached_block.copy_to_buf(&mut buf)?;
+                    return Ok(());
+                }
+                CacheLookupResult::Miss => {
+                    // Continue to disk read
+                }
             }
         }
 
@@ -373,16 +395,18 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             buf.as_mut_slice(),
         )?;
 
-        // Cache the decrypted data for future reads
-        let cached_data: Box<[u8; BLOCK_SIZE]> = Box::new(
-            buf.as_slice().try_into().map_err(|_| {
-                Error::with_msg(InvalidArgs, "buffer size mismatch")
-            })?
-        );
-        if let Err(_) = self.read_cache.insert(key, cached_data, CacheInsertHint::Normal) {
-            // Silently handle cache insertion failures to avoid SGX logging issues
-            // #[cfg(not(feature = "linux"))]
-            // warn!("[SwornDisk] Failed to insert block {} into read cache", lba);
+        // Cache the decrypted data for future reads (if cache is enabled)
+        if let Some(ref read_cache) = self.read_cache {
+            let cached_data: Box<[u8; BLOCK_SIZE]> = Box::new(
+                buf.as_slice().try_into().map_err(|_| {
+                    Error::with_msg(InvalidArgs, "buffer size mismatch")
+                })?
+            );
+            if let Err(_) = read_cache.insert(key, cached_data, CacheInsertHint::Normal) {
+                // Silently handle cache insertion failures to avoid SGX logging issues
+                // #[cfg(not(feature = "linux"))]
+                // warn!("[SwornDisk] Failed to insert block {} into read cache", lba);
+            }
         }
 
         Ok(())
@@ -409,26 +433,28 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             return Ok(());
         }
 
-        // CRITICAL FIX: Check read cache for remaining uncompleted blocks
-        if let Some(uncompleted_range) = range_query_ctx.range_uncompleted() {
-            for current_lba in uncompleted_range.start().lba..=uncompleted_range.end().lba {
-                let key = RecordKey { lba: current_lba };
-                
-                // Only check uncompleted blocks
-                if !range_query_ctx.contains_uncompleted(&key) {
-                    continue;
-                }
-                
-                // Check read cache for this specific block
-                match self.read_cache.lookup(key) {
-                    CacheLookupResult::Hit(cached_block) => {
-                        // FIXED: Direct copy from cache to target buffer
-                        let target_slice = buf_vec.nth_buf_mut_slice(current_lba - lba);
-                        target_slice.copy_from_slice(cached_block.data());
-                        range_query_ctx.mark_completed(key);
+        // CRITICAL FIX: Check read cache for remaining uncompleted blocks (if cache is enabled)
+        if let Some(ref read_cache) = self.read_cache {
+            if let Some(uncompleted_range) = range_query_ctx.range_uncompleted() {
+                for current_lba in uncompleted_range.start().lba..=uncompleted_range.end().lba {
+                    let key = RecordKey { lba: current_lba };
+                    
+                    // Only check uncompleted blocks
+                    if !range_query_ctx.contains_uncompleted(&key) {
+                        continue;
                     }
-                    CacheLookupResult::Miss => {
-                        // Cache miss - will be handled by LSM Tree lookup
+                    
+                    // Check read cache for this specific block
+                    match read_cache.lookup(key) {
+                        CacheLookupResult::Hit(cached_block) => {
+                            // FIXED: Direct copy from cache to target buffer
+                            let target_slice = buf_vec.nth_buf_mut_slice(current_lba - lba);
+                            target_slice.copy_from_slice(cached_block.data());
+                            range_query_ctx.mark_completed(key);
+                        }
+                        CacheLookupResult::Miss => {
+                            // Cache miss - will be handled by LSM Tree lookup
+                        }
                     }
                 }
             }
@@ -469,16 +495,18 @@ impl<D: BlockSet + 'static> DiskInner<D> {
                     buf_slice,
                 )?;
                 
-                // CRITICAL FIX: Cache the decrypted data for future reads
-                let cached_data: Box<[u8; BLOCK_SIZE]> = Box::new(
-                    buf_slice.try_into().map_err(|_| {
-                        Error::with_msg(InvalidArgs, "buffer size mismatch")
-                    })?
-                );
-                if let Err(_) = self.read_cache.insert(*key, cached_data, CacheInsertHint::Normal) {
-                    // Silently handle cache insertion failures to avoid SGX logging issues
-                    // #[cfg(not(feature = "linux"))]
-                    // warn!("[SwornDisk] Failed to insert block {} into read cache", key.lba);
+                // CRITICAL FIX: Cache the decrypted data for future reads (if cache is enabled)
+                if let Some(ref read_cache) = self.read_cache {
+                    let cached_data: Box<[u8; BLOCK_SIZE]> = Box::new(
+                        buf_slice.try_into().map_err(|_| {
+                            Error::with_msg(InvalidArgs, "buffer size mismatch")
+                        })?
+                    );
+                    if let Err(_) = read_cache.insert(*key, cached_data, CacheInsertHint::Normal) {
+                        // Silently handle cache insertion failures to avoid SGX logging issues
+                        // #[cfg(not(feature = "linux"))]
+                        // warn!("[SwornDisk] Failed to insert block {} into read cache", key.lba);
+                    }
                 }
             }
         }
@@ -507,11 +535,13 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             lba += 1;
         }
         
-        // CRITICAL FIX: Immediately invalidate read cache for written blocks
+        // CRITICAL FIX: Immediately invalidate read cache for written blocks (if cache is enabled)
         // This prevents stale cache data from being returned before flush
         if !written_keys.is_empty() {
-            let _invalidated = self.read_cache.invalidate_batch(&written_keys);
-            // Silent invalidation for better performance
+            if let Some(ref read_cache) = self.read_cache {
+                let _invalidated = read_cache.invalidate_batch(&written_keys);
+                // Silent invalidation for better performance
+            }
         }
         
         Ok(())
@@ -734,12 +764,12 @@ unsafe impl<D: BlockSet> Sync for DiskInner<D> {}
 struct TxLsmTreeListenerFactory<D> {
     store: Arc<TxLogStore<D>>,
     alloc_table: Arc<AllocTable>,
-    /// CRITICAL FIX: Add read cache reference for cache invalidation during compaction
-    read_cache: Arc<ReadCacheSystem>,
+    /// Optional read cache reference for cache invalidation during compaction
+    read_cache: Option<Arc<ReadCacheSystem>>,
 }
 
 impl<D> TxLsmTreeListenerFactory<D> {
-    fn new(store: Arc<TxLogStore<D>>, alloc_table: Arc<AllocTable>, read_cache: Arc<ReadCacheSystem>) -> Self {
+    fn new(store: Arc<TxLogStore<D>>, alloc_table: Arc<AllocTable>, read_cache: Option<Arc<ReadCacheSystem>>) -> Self {
         Self { store, alloc_table, read_cache }
     }
 }
@@ -766,12 +796,12 @@ impl<D: BlockSet + 'static> TxEventListenerFactory<RecordKey, RecordValue>
 struct TxLsmTreeListener<D> {
     tx_type: TxType,
     block_alloc: Arc<BlockAlloc<D>>,
-    /// CRITICAL FIX: Add read cache reference for cache invalidation during compaction
-    read_cache: Arc<ReadCacheSystem>,
+    /// Optional read cache reference for cache invalidation during compaction
+    read_cache: Option<Arc<ReadCacheSystem>>,
 }
 
 impl<D> TxLsmTreeListener<D> {
-    fn new(tx_type: TxType, block_alloc: Arc<BlockAlloc<D>>, read_cache: Arc<ReadCacheSystem>) -> Self {
+    fn new(tx_type: TxType, block_alloc: Arc<BlockAlloc<D>>, read_cache: Option<Arc<ReadCacheSystem>>) -> Self {
         Self {
             tx_type,
             block_alloc,
@@ -791,7 +821,9 @@ impl<D: BlockSet + 'static> TxEventListener<RecordKey, RecordValue> for TxLsmTre
             TxType::Compaction { .. } | TxType::Migration => {
                 // CRITICAL FIX: Invalidate read cache when records are reorganized during compaction
                 // This prevents reading stale cached data that points to old physical locations
-                self.read_cache.invalidate(*record.key());
+                if let Some(ref read_cache) = self.read_cache {
+                    read_cache.invalidate(*record.key());
+                }
                 Ok(())
             }
         }
@@ -806,7 +838,9 @@ impl<D: BlockSet + 'static> TxEventListener<RecordKey, RecordValue> for TxLsmTre
             TxType::Compaction { .. } | TxType::Migration => {
                 // CRITICAL FIX: Invalidate read cache when old records are dropped during compaction
                 // This ensures that any cached data pointing to the old physical location is removed
-                self.read_cache.invalidate(*record.key());
+                if let Some(ref read_cache) = self.read_cache {
+                    read_cache.invalidate(*record.key());
+                }
                 self.block_alloc.dealloc_block(record.value().hba)
             }
         }
@@ -974,8 +1008,8 @@ mod tests {
         let nblocks = 64 * 1024;
         let mem_disk = MemDisk::create(nblocks)?;
         let root_key = Key::random();
-        // Create a new `SwornDisk` then do some writes
-        let sworndisk = SwornDisk::create(mem_disk.clone(), root_key, None)?;
+        // Create a new `SwornDisk` then do some writes (with cache enabled)
+        let sworndisk = SwornDisk::create(mem_disk.clone(), root_key, None, true)?;
         let num_rw = 1024;
 
         // Submit a write block I/O request
@@ -1012,7 +1046,7 @@ mod tests {
         // Open the closed `SwornDisk` then test its data's existence
         drop(sworndisk);
         thread::spawn(move || -> Result<()> {
-            let opened_sworndisk = SwornDisk::open(mem_disk, root_key, None)?;
+            let opened_sworndisk = SwornDisk::open(mem_disk, root_key, None, true)?;
             let mut rbuf = Buf::alloc(2)?;
             opened_sworndisk.read(5 as Lba, rbuf.as_mut())?;
             assert_eq!(rbuf.as_slice()[0], 5u8);
