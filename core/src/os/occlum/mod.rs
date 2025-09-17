@@ -23,6 +23,7 @@ pub use sgx_tstd::collections::{BTreeMap, BTreeSet};
 pub use sgx_tstd::string::{String, ToString};
 pub use sgx_tstd::sync::{Arc, Weak};
 pub use sgx_tstd::sync::{SgxCondvar as Condvar, SgxMutex as CvarMutex};
+pub use sgx_tstd::sync::atomic::{AtomicUsize, Ordering};
 pub use sgx_tstd::thread::{spawn, JoinHandle};
 pub use sgx_tstd::vec::Vec;
 

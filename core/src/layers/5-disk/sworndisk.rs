@@ -10,7 +10,7 @@
 use super::bio::{BioReq, BioReqQueue, BioResp, BioType};
 use super::block_alloc::{AllocTable, BlockAlloc};
 use super::data_buf::DataBuf;
-use super::read_cache::{ReadCacheSystem, CacheLookupResult, CacheInsertHint};
+use super::simplified_read_cache::{ReadCacheSystem, CacheLookupResult};
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
 use crate::layers::log::TxLogStore;
 use crate::layers::lsm::{
@@ -112,12 +112,12 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
     /// Returns cache hit ratios, memory usage, and other performance metrics
     /// that can be used to tune cache behavior and monitor system performance.
     /// If read cache is disabled, returns default (empty) statistics.
-    pub fn cache_stats(&self) -> super::read_cache::CacheStats {
+    pub fn cache_stats(&self) -> super::simplified_read_cache::CacheStats {
         if let Some(ref read_cache) = self.inner.read_cache {
             read_cache.stats()
         } else {
             // Return default empty stats when cache is disabled
-            super::read_cache::CacheStats::default()
+            super::simplified_read_cache::CacheStats::default()
         }
     }
 
@@ -314,7 +314,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 /// formatting operations like mke2fs which can write significant amounts of metadata.
 /// This prevents data loss during frequent DataBuf flushes that could cause 
 /// inconsistencies in the LSM tree records.
-const DATA_BUF_CAP: usize = 8192;
+const DATA_BUF_CAP: usize = 1024;
 
 impl<D: BlockSet + 'static> DiskInner<D> {
     /// Read a specified number of blocks at a logical block address on the device.
@@ -394,57 +394,31 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             buf.as_mut_slice(),
         )?;
 
-        // SMART CACHING STRATEGY: Use adaptive caching for single block reads
-        // Cache single blocks selectively based on access patterns to balance performance
+        // UNCONDITIONAL CACHING STRATEGY: Cache all single block reads
+        // 
+        // Rationale based on SwornDisk architecture:
+        // 1. Every cache miss requires expensive LSM tree query + disk I/O + decryption
+        // 2. Indirect addressing means all LBAs can cause random disk access
+        // 3. Cache value is independent of LBA position - always beneficial
+        // 4. Simple strategy eliminates complex heuristics and edge cases
         if let Some(ref read_cache) = self.read_cache {
-            // Heuristic: Cache blocks that are likely to be accessed again
-            // - Metadata blocks (low LBA ranges are often metadata)
-            // - Recently accessed blocks in the same vicinity
-            // - Skip caching for obvious sequential patterns
+            let cached_data: Box<[u8; BLOCK_SIZE]> = Box::new(
+                buf.as_slice().try_into().map_err(|_| {
+                    Error::with_msg(InvalidArgs, "buffer size mismatch")
+                })?
+            );
             
-            let should_cache = self.should_cache_single_block(lba);
-            
-            if should_cache {
-                let cached_data: Box<[u8; BLOCK_SIZE]> = Box::new(
-                    buf.as_slice().try_into().map_err(|_| {
-                        Error::with_msg(InvalidArgs, "buffer size mismatch")
-                    })?
-                );
-                // Use Cold hint for single blocks to prioritize multi-block cache entries
-                if let Err(_) = read_cache.insert(key, cached_data, CacheInsertHint::Cold) {
-                    // Silently handle cache insertion failures
-                }
+            // Cache every single block read - maximal LSM query avoidance
+            if let Err(_) = read_cache.insert(key, cached_data) {
+                // Silently handle cache insertion failures (cache full, etc.)
             }
         }
 
         Ok(())
     }
 
-    /// Smart heuristic to decide whether to cache a single block read.
-    /// Balances cache utilization with performance overhead.
-    fn should_cache_single_block(&self, lba: Lba) -> bool {
-        // Heuristic 1: Always cache low LBA ranges (likely filesystem metadata)
-        // EXT2 metadata (superblock, group descriptors, inode tables) are typically
-        // in the first few thousand blocks and are frequently accessed
-        if lba < 8192 {  // First 32MB likely contains metadata
-            return true;
-        }
-        
-        // Heuristic 2: Cache with probability based on LBA to avoid cache pollution
-        // Higher LBAs (user data) get cached less frequently
-        // This creates a natural preference for metadata over user data
-        let cache_probability = if lba < 65536 {  // First 256MB
-            0.5  // 50% chance for early data blocks
-        } else if lba < 262144 {  // First 1GB  
-            0.2  // 20% chance for mid-range blocks
-        } else {
-            0.1  // 10% chance for high-range blocks (likely sequential data)
-        };
-        
-        // Simple pseudo-random decision based on LBA
-        // This ensures deterministic behavior for the same LBA
-        (lba as u32).wrapping_mul(2654435761) % 100 < (cache_probability * 100.0) as u32
-    }
+    // Note: Removed should_cache_single_block() function 
+    // Now using unconditional caching strategy for optimal performance
 
     fn read_multi_blocks<'a>(&self, lba: Lba, bufs: &'a mut [BufMut<'a>]) -> Result<()> {
         let mut buf_vec = BufMutVec::from_bufs(bufs);
@@ -467,13 +441,12 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             return Ok(());
         }
 
-        // PERFORMANCE OPTIMIZATION: Detect sequential read pattern to skip cache operations
-        // Sequential reads (large continuous blocks) have very low cache hit probability
-        // but high cache operation overhead. Skip cache for large sequential reads.
-        let is_likely_sequential = nblocks >= 32; // 128KB+ reads are likely sequential
-        let enable_cache_operations = !is_likely_sequential && self.read_cache.is_some();
+        // UNCONDITIONAL CACHING: Always check and populate cache for all reads
+        // Based on SwornDisk architecture analysis, every cache hit avoids expensive
+        // LSM query + disk I/O + decryption, making caching always beneficial
+        let enable_cache_operations = self.read_cache.is_some();
 
-        // Check read cache for remaining uncompleted blocks (only if beneficial)
+        // Check read cache for remaining uncompleted blocks
         if enable_cache_operations {
             let read_cache = self.read_cache.as_ref().unwrap();
             if let Some(uncompleted_range) = range_query_ctx.range_uncompleted() {
@@ -535,8 +508,8 @@ impl<D: BlockSet + 'static> DiskInner<D> {
                     buf_slice,
                 )?;
                 
-                // PERFORMANCE OPTIMIZATION: Only cache if likely to be beneficial
-                // Skip cache insertion for sequential reads to avoid allocation overhead
+                // UNCONDITIONAL CACHING: Cache all blocks from multi-block reads
+                // Every cached block avoids future LSM queries, disk I/O, and decryption
                 if enable_cache_operations {
                     let read_cache = self.read_cache.as_ref().unwrap();
                     let cached_data: Box<[u8; BLOCK_SIZE]> = Box::new(
@@ -544,7 +517,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
                             Error::with_msg(InvalidArgs, "buffer size mismatch")
                         })?
                     );
-                    if let Err(_) = read_cache.insert(*key, cached_data, CacheInsertHint::Normal) {
+                    if let Err(_) = read_cache.insert(*key, cached_data) {
                         // Silently handle cache insertion failures to avoid SGX logging issues
                         // #[cfg(not(feature = "linux"))]
                         // warn!("[SwornDisk] Failed to insert block {} into read cache", key.lba);
@@ -917,7 +890,7 @@ pub(super) struct Record {
 /// The key of a `Record`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub(super) struct RecordKey {
+pub struct RecordKey {
     /// Logical block address of user data block.
     pub lba: Lba,
 }

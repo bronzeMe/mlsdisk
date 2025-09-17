@@ -45,6 +45,9 @@ pub use btree::BTreeMap;
 /// Reuse `spawn` and `JoinHandle` in `bindings::thread`.
 pub use bindings::thread::{spawn, JoinHandle};
 
+/// Atomic operations for caching
+pub use core::sync::atomic::{AtomicUsize, Ordering};
+
 /// Wrap `alloc::boxed::Box` provided by kernel.
 #[repr(transparent)]
 pub struct Box<T: ?Sized> {

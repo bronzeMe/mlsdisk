@@ -33,6 +33,7 @@ pub use spin::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 pub use std::thread::{spawn, JoinHandle};
 
 pub use std::sync::{Condvar, Mutex as CvarMutex};
+pub use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Reuse `std::thread::ThreadId`.
 pub type Tid = std::thread::ThreadId;

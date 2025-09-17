@@ -4,8 +4,8 @@
 mod jinux;
 #[cfg(feature = "jinux")]
 pub use self::jinux::{
-    spawn, Aead, AeadIv, AeadKey, AeadMac, Arc, BTreeMap, Box, Condvar, CurrentThread, CvarMutex,
-    HashMap, HashSet, JoinHandle, Mutex, MutexGuard, Pages, Rng, RwLock, RwLockReadGuard,
+    spawn, Aead, AeadIv, AeadKey, AeadMac, Arc, AtomicUsize, BTreeMap, Box, Condvar, CurrentThread, CvarMutex,
+    HashMap, HashSet, JoinHandle, Mutex, MutexGuard, Ordering, Pages, Rng, RwLock, RwLockReadGuard,
     RwLockWriteGuard, Skcipher, SkcipherIv, SkcipherKey, String, Tid, ToString, Vec, Weak,
     PAGE_SIZE,
 };
@@ -14,8 +14,8 @@ pub use self::jinux::{
 mod linux;
 #[cfg(feature = "linux")]
 pub use self::linux::{
-    spawn, Aead, AeadIv, AeadKey, AeadMac, Arc, BTreeMap, Box, Condvar, CurrentThread, CvarMutex,
-    HashMap, HashSet, JoinHandle, Mutex, MutexGuard, Pages, Rng, RwLock, RwLockReadGuard,
+    spawn, Aead, AeadIv, AeadKey, AeadMac, Arc, AtomicUsize, BTreeMap, Box, Condvar, CurrentThread, CvarMutex,
+    HashMap, HashSet, JoinHandle, Mutex, MutexGuard, Ordering, Pages, Rng, RwLock, RwLockReadGuard,
     RwLockWriteGuard, Skcipher, SkcipherIv, SkcipherKey, String, Tid, ToString, Vec, Weak,
     PAGE_SIZE,
 };
@@ -24,8 +24,8 @@ pub use self::linux::{
 mod occlum;
 #[cfg(feature = "occlum")]
 pub use self::occlum::{
-    spawn, Aead, AeadIv, AeadKey, AeadMac, Arc, BTreeMap, BTreeSet, Box, Condvar, CurrentThread, CvarMutex,
-    HashMap, HashSet, JoinHandle, Mutex, MutexGuard, Pages, Rng, RwLock, RwLockReadGuard,
+    spawn, Aead, AeadIv, AeadKey, AeadMac, Arc, AtomicUsize, BTreeMap, BTreeSet, Box, Condvar, CurrentThread, CvarMutex,
+    HashMap, HashSet, JoinHandle, Mutex, MutexGuard, Ordering, Pages, Rng, RwLock, RwLockReadGuard,
     RwLockWriteGuard, Skcipher, SkcipherIv, SkcipherKey, String, Tid, ToString, Vec, Weak,
     PAGE_SIZE,
 };
@@ -34,8 +34,8 @@ pub use self::occlum::{
 mod std;
 #[cfg(feature = "std")]
 pub use self::std::{
-    spawn, Aead, AeadIv, AeadKey, AeadMac, Arc, BTreeMap, BTreeSet, Box, Condvar, CurrentThread, CvarMutex,
-    HashMap, HashSet, JoinHandle, Mutex, MutexGuard, Pages, Rng, RwLock, RwLockReadGuard,
+    spawn, Aead, AeadIv, AeadKey, AeadMac, Arc, AtomicUsize, BTreeMap, BTreeSet, Box, Condvar, CurrentThread, CvarMutex,
+    HashMap, HashSet, JoinHandle, Mutex, MutexGuard, Ordering, Pages, Rng, RwLock, RwLockReadGuard,
     RwLockWriteGuard, Skcipher, SkcipherIv, SkcipherKey, String, Tid, ToString, Vec, Weak,
     PAGE_SIZE,
 };
