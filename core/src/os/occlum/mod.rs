@@ -19,7 +19,7 @@ pub use hashbrown::{HashMap, HashSet};
 pub use spin::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 pub use sgx_tstd::boxed::Box;
-pub use sgx_tstd::collections::{BTreeMap, BTreeSet};
+pub use sgx_tstd::collections::{BTreeMap, BTreeSet, VecDeque};
 pub use sgx_tstd::string::{String, ToString};
 pub use sgx_tstd::sync::{Arc, Weak};
 pub use sgx_tstd::sync::{SgxCondvar as Condvar, SgxMutex as CvarMutex};

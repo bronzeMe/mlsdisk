@@ -25,7 +25,7 @@ mod occlum;
 #[cfg(feature = "occlum")]
 pub use self::occlum::{
     spawn, Aead, AeadIv, AeadKey, AeadMac, Arc, AtomicUsize, BTreeMap, BTreeSet, Box, Condvar, CurrentThread, CvarMutex,
-    HashMap, HashSet, JoinHandle, Mutex, MutexGuard, Ordering, Pages, Rng, RwLock, RwLockReadGuard,
+    HashMap, HashSet, JoinHandle, Mutex, MutexGuard, Ordering, Pages, Rng, RwLock, RwLockReadGuard, VecDeque,
     RwLockWriteGuard, Skcipher, SkcipherIv, SkcipherKey, String, Tid, ToString, Vec, Weak,
     PAGE_SIZE,
 };

@@ -10,7 +10,7 @@
 use super::bio::{BioReq, BioReqQueue, BioResp, BioType};
 use super::block_alloc::{AllocTable, BlockAlloc};
 use super::data_buf::DataBuf;
-use super::simplified_read_cache::{ReadCacheSystem, CacheLookupResult};
+use super::simplified_read_cache::{ReadCacheSystem, CacheLookupResult, CacheLookupResultWithPrefetch, PrefetchSuggestion};
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
 use crate::layers::log::TxLogStore;
 use crate::layers::lsm::{
@@ -107,10 +107,16 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         self.inner.user_data_disk.nblocks()
     }
 
-    /// Get read cache statistics for monitoring and optimization.
+    /// Get enhanced read cache statistics including prefetch metrics.
     ///
-    /// Returns cache hit ratios, memory usage, and other performance metrics
-    /// that can be used to tune cache behavior and monitor system performance.
+    /// Returns comprehensive cache performance metrics including:
+    /// - Traditional cache hit/miss ratios  
+    /// - Memory usage and capacity information
+    /// - Prefetch hit ratios for sequential read optimization
+    /// - Eviction statistics for cache tuning
+    /// 
+    /// These metrics are essential for monitoring the effectiveness of the
+    /// intelligent prefetch system and overall cache performance.
     /// If read cache is disabled, returns default (empty) statistics.
     pub fn cache_stats(&self) -> super::simplified_read_cache::CacheStats {
         if let Some(ref read_cache) = self.inner.read_cache {
@@ -366,14 +372,22 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             return Ok(());
         }
 
-        // Check read cache system next (if enabled)
+        // Check read cache system next (if enabled) - with prefetch awareness
         if let Some(ref read_cache) = self.read_cache {
-            match read_cache.lookup_and_copy(key, &mut buf) {
+            let cache_result = read_cache.lookup_and_copy_with_prefetch(key, &mut buf);
+            match cache_result.result {
                 CacheLookupResult::Hit => {
+                    // Cache hit! Report potential prefetch hit for statistics
+                    read_cache.report_prefetch_hit(key);
+                    
                     // Single-copy optimization: data directly copied to buffer
                     return Ok(());
                 }
                 CacheLookupResult::Miss => {
+                    // Handle prefetch suggestion for sequential reads optimization
+                    if let Some(suggestion) = cache_result.prefetch_suggestion {
+                        self.handle_prefetch_suggestion(suggestion);
+                    }
                     // Continue to disk read
                 }
             }
@@ -653,6 +667,106 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         self.tx_log_store.sync()?;
 
         self.user_data_disk.flush()
+    }
+    
+    /// Handle prefetch suggestions from cache system for sequential read optimization.
+    /// 
+    /// This method implements intelligent async prefetch based on cache system suggestions.
+    /// It uses a conservative approach to avoid overwhelming the system while providing
+    /// meaningful performance benefits for large file sequential reads.
+    fn handle_prefetch_suggestion(&self, suggestion: PrefetchSuggestion) {
+        // Only proceed with high-confidence suggestions to avoid wasted I/O
+        if suggestion.confidence < 70 {
+            #[cfg(not(feature = "linux"))]
+            debug!("[SwornDisk] Skipping low-confidence prefetch suggestion ({}%)", suggestion.confidence);
+            return;
+        }
+        
+        let prefetch_count = suggestion.suggested_keys.len().min(4); // Conservative limit
+        if prefetch_count == 0 {
+            return;
+        }
+        
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk] Processing prefetch suggestion: {} keys, confidence: {}%", 
+               prefetch_count, suggestion.confidence);
+        
+        // Process prefetch suggestions with high-confidence keys only
+        for &prefetch_key in suggestion.suggested_keys.iter().take(prefetch_count) {
+            if let Err(e) = self.execute_single_prefetch(prefetch_key) {
+                #[cfg(not(feature = "linux"))]
+                debug!("[SwornDisk] Prefetch failed for LBA {}: {:?}", prefetch_key.lba, e);
+                
+                // On error, stop prefetching to avoid cascade failures
+                break;
+            }
+        }
+    }
+    
+    /// Execute a single block prefetch operation.
+    /// 
+    /// This performs the actual async read and cache insertion for a single block.
+    /// Returns early if the block is already in cache or LSM tree lookup fails.
+    fn execute_single_prefetch(&self, key: RecordKey) -> Result<()> {
+        // Quick check: skip if already in cache
+        if let Some(ref read_cache) = self.read_cache {
+            // Use a temporary buffer to check cache without affecting statistics
+            let mut temp_buf = [0u8; BLOCK_SIZE];
+            if matches!(read_cache.lookup_and_copy_to_slice(key, &mut temp_buf), CacheLookupResult::Hit) {
+                // Already cached, no need to prefetch
+                return Ok(());
+            }
+        }
+        
+        // Skip if already in DataBuf (write buffer)
+        let mut temp_buf = Buf::alloc(1).map_err(|_| Error::with_msg(OutOfMemory, "prefetch buffer allocation failed"))?;
+        if self.data_buf.get(key, &mut temp_buf.as_mut()).is_some() {
+            return Ok(());
+        }
+        
+        // Lookup in LSM tree - this is the expensive operation we're trying to optimize
+        let value = match self.logical_block_table.get(&key) {
+            Ok(v) => v,
+            Err(_) => {
+                // Block doesn't exist, skip prefetch
+                return Ok(());
+            }
+        };
+        
+        // Perform actual disk read and decryption
+        let mut cipher = Buf::alloc(1).map_err(|_| Error::with_msg(OutOfMemory, "prefetch cipher buffer allocation failed"))?;
+        self.user_data_disk.read(value.hba, cipher.as_mut())?;
+        
+        // Decrypt the data
+        Aead::new().decrypt(
+            cipher.as_slice(),
+            &value.key,
+            &Iv::new_zeroed(),
+            &[],
+            &value.mac,
+            temp_buf.as_mut_slice(),
+        )?;
+        
+        // Insert into cache as prefetched data
+        if let Some(ref read_cache) = self.read_cache {
+            let cached_data: Box<[u8; BLOCK_SIZE]> = Box::new(
+                temp_buf.as_slice().try_into().map_err(|_| {
+                    Error::with_msg(InvalidArgs, "prefetch buffer size mismatch")
+                })?
+            );
+            
+            // Use prefetch-specific insertion to avoid affecting normal cache statistics
+            if let Err(_) = read_cache.insert_prefetched(key, cached_data) {
+                // Prefetch insertion failure is not critical - just log and continue
+                #[cfg(not(feature = "linux"))]
+                debug!("[SwornDisk] Prefetch cache insertion failed for LBA {}", key.lba);
+            } else {
+                #[cfg(not(feature = "linux"))]
+                debug!("[SwornDisk] Successfully prefetched block LBA {}", key.lba);
+            }
+        }
+        
+        Ok(())
     }
 
     /// Handle one block I/O request. Mark the request completed when finished,
@@ -1065,5 +1179,68 @@ mod tests {
         })
         .join()
         .unwrap()
+    }
+
+    #[test] 
+    fn test_prefetch_integration() -> Result<()> {
+        let nblocks = 16 * 1024;
+        let mem_disk = MemDisk::create(nblocks)?;
+        let root_key = Key::random();
+        
+        // Create SwornDisk with cache enabled for prefetch testing
+        let sworndisk = SwornDisk::create(mem_disk, root_key, None, true)?;
+        
+        // Write sequential data pattern
+        let num_blocks = 20;
+        let mut wbuf = Buf::alloc(1)?;
+        for i in 0..num_blocks {
+            let buf_slice = wbuf.as_mut_slice();
+            buf_slice.fill(i as u8);
+            sworndisk.write(i as Lba, wbuf.as_ref())?;
+        }
+        
+        // Sync to ensure data is written
+        sworndisk.sync()?;
+        
+        // Simulate sequential read pattern to trigger prefetch
+        let mut rbuf = Buf::alloc(1)?;
+        
+        // First few reads should miss cache but establish pattern
+        for i in 0..5 {
+            sworndisk.read(i as Lba, rbuf.as_mut())?;
+            assert_eq!(rbuf.as_slice()[0], i as u8);
+        }
+        
+        // Get initial stats
+        let initial_stats = sworndisk.cache_stats();
+        println!("Initial cache stats - Hits: {}, Misses: {}, Prefetch Hits: {}", 
+                 initial_stats.total_hits(), 
+                 initial_stats.total_misses(),
+                 initial_stats.total_prefetch_hits());
+        
+        // Continue sequential reads - prefetch should kick in
+        for i in 5..15 {
+            sworndisk.read(i as Lba, rbuf.as_mut())?;
+            assert_eq!(rbuf.as_slice()[0], i as u8);
+        }
+        
+        // Check final stats - should see improvement from prefetch
+        let final_stats = sworndisk.cache_stats();
+        println!("Final cache stats - Hits: {}, Misses: {}, Prefetch Hits: {}", 
+                 final_stats.total_hits(), 
+                 final_stats.total_misses(),
+                 final_stats.total_prefetch_hits());
+        
+        // Verify cache is working (more hits than initial)
+        assert!(final_stats.total_hits() > initial_stats.total_hits());
+        
+        // Verify cache has reasonable hit ratio for sequential reads
+        let hit_ratio = final_stats.hit_ratio();
+        println!("Cache hit ratio: {:.1}%", hit_ratio);
+        
+        // For sequential reads with prefetch, we should see decent hit ratio
+        assert!(hit_ratio > 10.0); // At least some cache effectiveness
+        
+        Ok(())
     }
 }
