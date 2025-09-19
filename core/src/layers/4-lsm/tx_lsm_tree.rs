@@ -1030,3 +1030,9 @@ mod tests {
         Ok(())
     }
 }
+
+impl<K: RecordKey<K>, V, D> Clone for TxLsmTree<K, V, D> {
+    fn clone(&self) -> Self {
+        TxLsmTree(self.0.clone())
+    }
+}

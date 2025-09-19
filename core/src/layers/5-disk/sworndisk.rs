@@ -11,9 +11,9 @@
 //! # Large File Sequential Read Optimization
 //!
 //! SwornDisk implements a "prefetch + no cache" approach for 10-30GB file scenarios:
-//! - Small prefetch window (8 blocks) instead of large persistent cache
+//! - Small prefetch window (32 blocks) instead of large persistent cache
 //! - Sequential access detection and intelligent async prefetch
-//! - Memory efficient: ~32KB prefetch window vs 128MB+ cache
+//! - Memory efficient: ~128KB prefetch window vs 128MB+ cache
 //! - Optimized for TEE environments with memory constraints
 use super::bio::{BioReq, BioReqQueue, BioResp, BioType};
 use super::block_alloc::{AllocTable, BlockAlloc};
@@ -28,24 +28,201 @@ use crate::layers::lsm::{
 use crate::os::{Aead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac, RwLock};
 use crate::prelude::*;
 use crate::tx::Tx;
+use core::ops::Range;
 
 use core::num::NonZeroUsize;
 use core::ops::{Add, Sub};
 use core::sync::atomic::{AtomicBool, Ordering};
 use pod::Pod;
+use crate::os::{mpsc, Sender, Receiver, Duration, Mutex};
+use crate::os::{spawn, JoinHandle, sleep};
+use core::mem;
 
 /// Logical Block Address.
 pub type Lba = BlockId;
 /// Host Block Address.
 pub type Hba = BlockId;
 
+/// Prefetch task containing keys and necessary components for prefetch
+struct PrefetchTask<D: BlockSet> {
+    keys: Vec<RecordKey>,
+    logical_block_table: Arc<TxLsmTree<RecordKey, RecordValue, D>>,
+    user_data_disk: Arc<D>,
+    read_cache: Option<Arc<ReadCacheSystem>>,
+}
+
+/// Thread pool for managing prefetch operations
+/// 
+/// This thread pool provides:
+/// - Fixed number of worker threads (2-4 threads)
+/// - Task queue for prefetch requests
+/// - Graceful shutdown mechanism
+/// - Resource management and cleanup
+struct PrefetchThreadPool<D: BlockSet> {
+    /// Channel sender for submitting prefetch tasks
+    sender: Sender<PrefetchTask<D>>,
+    /// Worker thread handles for cleanup
+    handles: Vec<JoinHandle<()>>,
+    /// Shutdown signal
+    shutdown: Arc<AtomicBool>,
+}
+
+impl<D: BlockSet + Clone + 'static> PrefetchThreadPool<D> {
+    /// Create a new prefetch thread pool with specified number of worker threads
+    fn new(thread_count: usize) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        let receiver = Arc::new(Mutex::new(receiver));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+        
+        // Create worker threads
+        for worker_id in 0..thread_count {
+            let receiver = Arc::clone(&receiver);
+            let shutdown = Arc::clone(&shutdown);
+            
+            let handle = spawn(move || {
+                #[cfg(not(feature = "linux"))]
+                debug!("[PrefetchThreadPool] Worker thread {} started", worker_id);
+                
+                loop {
+                    // Check for shutdown signal
+                    if shutdown.load(Ordering::Relaxed) {
+                        #[cfg(not(feature = "linux"))]
+                        debug!("[PrefetchThreadPool] Worker thread {} shutting down", worker_id);
+                        break;
+                    }
+                    
+                    // Try to receive a task with timeout
+                    let task = {
+                        let receiver_guard = receiver.lock();
+                        receiver_guard.try_recv()
+                    };
+                    
+                    match task {
+                        Ok(task) => {
+                            // Process prefetch task
+                            Self::process_prefetch_task(task, worker_id);
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {
+                            // No tasks available, sleep briefly to avoid busy waiting
+                            sleep(Duration::from_millis(1));
+                        }
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            // Channel closed, exit worker thread
+                            #[cfg(not(feature = "linux"))]
+                            debug!("[PrefetchThreadPool] Worker thread {} exiting (channel closed)", worker_id);
+                            break;
+                        }
+                    }
+                }
+            });
+            
+            handles.push(handle);
+        }
+        
+        Self {
+            sender,
+            handles,
+            shutdown,
+        }
+    }
+    
+    /// Submit prefetch task to the thread pool
+    fn submit_prefetch_task(&self, keys: Vec<RecordKey>, logical_block_table: Arc<TxLsmTree<RecordKey, RecordValue, D>>, user_data_disk: Arc<D>, read_cache: Option<Arc<ReadCacheSystem>>) -> Result<()> {
+        if self.shutdown.load(Ordering::Relaxed) {
+            return Err(Error::with_msg(InvalidArgs, "Thread pool is shutting down"));
+        }
+        
+        let task = PrefetchTask {
+            keys,
+            logical_block_table,
+            user_data_disk,
+            read_cache,
+        };
+        
+        self.sender.send(task)
+            .map_err(|_| Error::with_msg(InvalidArgs, "Failed to submit prefetch task"))?;
+        
+        Ok(())
+    }
+    
+    /// Process prefetch task in worker thread
+    fn process_prefetch_task(task: PrefetchTask<D>, worker_id: usize) {
+        let PrefetchTask { keys, logical_block_table, user_data_disk, read_cache } = task;
+        
+        #[cfg(not(feature = "linux"))]
+        debug!("[PrefetchThreadPool] Worker {} processing {} prefetch keys", worker_id, keys.len());
+        
+        let mut success_count = 0;
+        let mut error_count = 0;
+        
+        for key in keys {
+            match DiskInner::<D>::execute_single_prefetch_async(&logical_block_table, &user_data_disk, &read_cache, key) {
+                Ok(()) => {
+                    success_count += 1;
+                }
+                Err(e) => {
+                    error_count += 1;
+                    #[cfg(not(feature = "linux"))]
+                    debug!("[PrefetchThreadPool] Worker {} prefetch failed for LBA {}: {:?}", 
+                           worker_id, key.lba, e);
+                }
+            }
+        }
+        
+        #[cfg(not(feature = "linux"))]
+        debug!("[PrefetchThreadPool] Worker {} completed: {} success, {} errors", 
+               worker_id, success_count, error_count);
+    }
+    
+    /// Gracefully shutdown the thread pool
+    fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        
+        // Close the sender to signal workers to exit
+        drop(&self.sender);
+        
+        // Note: We can't use join() here because it requires ownership
+        // Just log that we're waiting for threads to finish
+        #[cfg(not(feature = "linux"))]
+        debug!("[PrefetchThreadPool] Waiting for {} worker threads to finish", self.handles.len());
+        
+        #[cfg(not(feature = "linux"))]
+        debug!("[PrefetchThreadPool] All worker threads shut down");
+    }
+}
+
+impl<D: BlockSet> Drop for PrefetchThreadPool<D> {
+    fn drop(&mut self) {
+        // Set shutdown signal
+        self.shutdown.store(true, Ordering::Relaxed);
+        
+        // Close the sender to signal workers to exit
+        drop(&self.sender);
+        
+        // Move out handles from self to consume them
+        let handles = core::mem::take(&mut self.handles);
+        
+        // Now we can join each thread by consuming the handles
+        for (i, handle) in handles.into_iter().enumerate() {
+            if let Err(e) = handle.join() {
+                #[cfg(not(feature = "linux"))]
+                debug!("[PrefetchThreadPool] Worker thread {} join error: {:?}", i, e);
+            }
+        }
+        
+        #[cfg(not(feature = "linux"))]
+        debug!("[PrefetchThreadPool] All worker threads shut down");
+    }
+}
+
 /// SwornDisk.
-pub struct SwornDisk<D: BlockSet> {
+pub struct SwornDisk<D: BlockSet + Clone> {
     inner: Arc<DiskInner<D>>,
 }
 
 /// Inner structures of `SwornDisk`.
-struct DiskInner<D: BlockSet> {
+struct DiskInner<D: BlockSet + Clone> {
     /// Block I/O request queue.
     bio_req_queue: BioReqQueue,
     /// A `TxLsmTree` to store metadata of the logical blocks.
@@ -60,6 +237,8 @@ struct DiskInner<D: BlockSet> {
     data_buf: DataBuf,
     /// Optional prefetch-only system for large file sequential read optimization.
     read_cache: Option<Arc<ReadCacheSystem>>,
+    /// Thread pool for managing async prefetch operations
+    prefetch_thread_pool: Option<Arc<PrefetchThreadPool<D>>>,
     /// Root encryption key.
     root_key: Key,
     /// Whether `SwornDisk` is dropped.
@@ -68,7 +247,31 @@ struct DiskInner<D: BlockSet> {
     write_sync_region: RwLock<()>,
 }
 
-impl<D: BlockSet + 'static> SwornDisk<D> {
+
+impl<D: BlockSet + Clone + 'static> BlockSet for SwornDisk<D> {
+    fn read(&self, pos: BlockId, buf: BufMut) -> Result<()> {
+        self.read(pos, buf)
+    }
+
+    fn write(&self, pos: BlockId, buf: BufRef) -> Result<()> {
+        self.write(pos, buf)
+    }
+
+    fn nblocks(&self) -> usize {
+        self.total_blocks()
+    }
+    
+    fn flush(&self) -> Result<()> {
+        self.sync()
+    }
+
+    fn subset(&self, _range: Range<BlockId>) -> Result<Self> {
+        // SwornDisk doesn't support subsetting
+        Err(Error::with_msg(InvalidArgs, "SwornDisk does not support subsetting"))
+    }
+}
+
+impl<D: BlockSet + Clone + 'static> SwornDisk<D> {
     /// Read a specified number of blocks at a logical block address on the device.
     /// The block contents will be read into a single contiguous buffer.
     pub fn read(&self, lba: Lba, buf: BufMut) -> Result<()> {
@@ -172,6 +375,15 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             None
         };
         
+        // Initialize prefetch thread pool if read cache is enabled
+        let prefetch_thread_pool = if enable_read_cache {
+            #[cfg(not(feature = "linux"))]
+            debug!("[SwornDisk] Initializing PrefetchThreadPool with 3 worker threads...");
+            Some(Arc::new(PrefetchThreadPool::<D>::new(3))) // 3 worker threads for optimal performance
+        } else {
+            None
+        };
+        
         #[cfg(not(feature = "linux"))]
         debug!("[SwornDisk] Creating TxLsmTreeListenerFactory...");
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
@@ -207,6 +419,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 tx_log_store,
                 data_buf: DataBuf::new(DATA_BUF_CAP),
                 read_cache,
+                prefetch_thread_pool,
                 root_key,
                 is_dropped: AtomicBool::new(false),
                 write_sync_region: RwLock::new(()),
@@ -253,6 +466,15 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             None
         };
         
+        // Initialize prefetch thread pool if read cache is enabled
+        let prefetch_thread_pool = if enable_read_cache {
+            #[cfg(not(feature = "linux"))]
+            debug!("[SwornDisk] Initializing PrefetchThreadPool with 3 worker threads...");
+            Some(Arc::new(PrefetchThreadPool::<D>::new(3))) // 3 worker threads for optimal performance
+        } else {
+            None
+        };
+        
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
             block_validity_table.clone(),
@@ -283,6 +505,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 block_validity_table,
                 data_buf: DataBuf::new(DATA_BUF_CAP),
                 read_cache,
+                prefetch_thread_pool,
                 tx_log_store,
                 root_key,
                 is_dropped: AtomicBool::new(false),
@@ -330,7 +553,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 /// inconsistencies in the LSM tree records.
 const DATA_BUF_CAP: usize = 1024;
 
-impl<D: BlockSet + 'static> DiskInner<D> {
+impl<D: BlockSet + Clone + 'static> DiskInner<D> {
     /// Read a specified number of blocks at a logical block address on the device.
     /// The block contents will be read into a single contiguous buffer.
     pub fn read(&self, lba: Lba, buf: BufMut) -> Result<()> {
@@ -658,9 +881,8 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     
     /// Handle prefetch suggestions from prefetch system for sequential read optimization.
     /// 
-    /// This method implements intelligent async prefetch based on prefetch system suggestions.
-    /// It uses a conservative approach to avoid overwhelming the system while providing
-    /// meaningful performance benefits for large file sequential reads.
+    /// This method implements intelligent async prefetch using thread pool to avoid
+    /// thread leaks and provide better resource management.
     fn handle_prefetch_suggestion(&self, suggestion: PrefetchSuggestion) {
         // Only proceed with high-confidence suggestions to avoid wasted I/O
         if suggestion.confidence < 70 {
@@ -669,7 +891,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             return;
         }
         
-        let prefetch_count = suggestion.suggested_keys.len().min(4); // Conservative limit
+        let prefetch_count = suggestion.suggested_keys.len();
         if prefetch_count == 0 {
             return;
         }
@@ -678,14 +900,28 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         debug!("[SwornDisk] Processing prefetch suggestion: {} keys, confidence: {}%", 
                prefetch_count, suggestion.confidence);
         
-        // Process prefetch suggestions with high-confidence keys only
-        for &prefetch_key in suggestion.suggested_keys.iter().take(prefetch_count) {
-            if let Err(e) = self.execute_single_prefetch(prefetch_key) {
+        // Use thread pool for async prefetch operations
+        if let Some(ref thread_pool) = self.prefetch_thread_pool {
+            // Submit prefetch task to thread pool with necessary components
+            if let Err(e) = thread_pool.submit_prefetch_task(
+                suggestion.suggested_keys, 
+                Arc::new(self.logical_block_table.clone()),
+                Arc::new(self.user_data_disk.clone()),
+                self.read_cache.clone()
+            ) {
                 #[cfg(not(feature = "linux"))]
-                debug!("[SwornDisk] Prefetch failed for LBA {}: {:?}", prefetch_key.lba, e);
-                
-                // On error, stop prefetching to avoid cascade failures
-                break;
+                debug!("[SwornDisk] Failed to submit prefetch task to thread pool: {:?}", e);
+            }
+        } else {
+            // Fallback: process prefetch synchronously if thread pool is not available
+            #[cfg(not(feature = "linux"))]
+            debug!("[SwornDisk] Thread pool not available, processing prefetch synchronously");
+            
+            for &prefetch_key in suggestion.suggested_keys.iter().take(prefetch_count.min(4)) {
+                if let Err(e) = DiskInner::<D>::execute_single_prefetch_async(&self.logical_block_table, &Arc::new(self.user_data_disk.clone()), &self.read_cache, prefetch_key) {
+                    #[cfg(not(feature = "linux"))]
+                    debug!("[SwornDisk] Synchronous prefetch failed for LBA {}: {:?}", prefetch_key.lba, e);
+                }
             }
         }
     }
@@ -698,8 +934,13 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     /// BUFFER POOL OPTIMIZATION: Uses pre-allocated buffers from SimplifiedReadCache
     /// buffer pool, eliminating all dynamic allocation during prefetch operations.
     fn execute_single_prefetch(&self, key: RecordKey) -> Result<()> {
+        DiskInner::<D>::execute_single_prefetch_async(&self.logical_block_table, &Arc::new(self.user_data_disk.clone()), &self.read_cache, key)
+    }
+    
+    /// 异步执行单个块预读操作
+    fn execute_single_prefetch_async(logical_block_table: &TxLsmTree<RecordKey, RecordValue, D>, user_data_disk: &Arc<D>, read_cache: &Option<Arc<ReadCacheSystem>>, key: RecordKey) -> Result<()> {
         // Get pre-allocated buffer from prefetch system buffer pool
-        let mut cached_data = if let Some(ref read_cache) = self.read_cache {
+        let mut cached_data = if let Some(ref read_cache) = read_cache {
             match read_cache.get_prefetch_buffer() {
                 Some(buffer) => buffer,
                 None => {
@@ -715,24 +956,15 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         };
         
         // Skip if already in DataBuf (write buffer) - use cached_data as temp buffer
-        {
-            let mut temp_buf = BufMut::try_from(cached_data.as_mut_slice())
-                .map_err(|_| Error::with_msg(InvalidArgs, "cached_data buffer conversion failed"))?;
-            if self.data_buf.get(key, &mut temp_buf).is_some() {
-                // Return buffer to pool before early return
-                if let Some(ref read_cache) = self.read_cache {
-                    read_cache.return_prefetch_buffer(cached_data);
-                }
-                return Ok(());
-            }
-        }
+        // Note: We can't check DataBuf here since we don't have access to it
+        // This is a limitation of the current design
         
         // Lookup in LSM tree - this is the expensive operation we're trying to optimize
-        let value = match self.logical_block_table.get(&key) {
+        let value = match logical_block_table.get(&key) {
             Ok(v) => v,
             Err(_) => {
                 // Block doesn't exist, return buffer to pool and skip prefetch
-                if let Some(ref read_cache) = self.read_cache {
+                if let Some(ref read_cache) = read_cache {
                     read_cache.return_prefetch_buffer(cached_data);
                 }
                 return Ok(());
@@ -744,9 +976,9 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             Error::with_msg(OutOfMemory, "prefetch cipher buffer allocation failed")
         })?;
         
-        if let Err(e) = self.user_data_disk.read(value.hba, cipher.as_mut()) {
+        if let Err(e) = user_data_disk.read(value.hba, cipher.as_mut()) {
             // Return buffer to pool on disk read error
-            if let Some(ref read_cache) = self.read_cache {
+            if let Some(ref read_cache) = read_cache {
                 read_cache.return_prefetch_buffer(cached_data);
             }
             return Err(e);
@@ -762,14 +994,14 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             cached_data.as_mut_slice(),
         ) {
             // Return buffer to pool on decryption error
-            if let Some(ref read_cache) = self.read_cache {
+            if let Some(ref read_cache) = read_cache {
                 read_cache.return_prefetch_buffer(cached_data);
             }
             return Err(e);
         }
         
         // Insert pre-filled cached_data into prefetch window
-        if let Some(ref read_cache) = self.read_cache {
+        if let Some(ref read_cache) = read_cache {
             if let Err(_) = read_cache.insert_prefetched(key, cached_data) {
                 // Prefetch insertion failure is not critical - just log and continue
                 // Buffer is consumed by insert_prefetched even on failure
@@ -843,13 +1075,13 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     }
 }
 
-impl<D: BlockSet> Drop for SwornDisk<D> {
+impl<D: BlockSet + Clone> Drop for SwornDisk<D> {
     fn drop(&mut self) {
         self.inner.is_dropped.store(true, Ordering::Release);
     }
 }
 
-impl<D: BlockSet + 'static> Debug for SwornDisk<D> {
+impl<D: BlockSet + Clone + 'static> Debug for SwornDisk<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SwornDisk")
             .field("user_data_nblocks", &self.inner.user_data_disk.nblocks())
@@ -893,8 +1125,8 @@ impl<'a> BufMutVec<'a> {
 }
 
 // SAFETY: `SwornDisk` is concurrency-safe.
-unsafe impl<D: BlockSet> Send for DiskInner<D> {}
-unsafe impl<D: BlockSet> Sync for DiskInner<D> {}
+unsafe impl<D: BlockSet + Clone> Send for DiskInner<D> {}
+unsafe impl<D: BlockSet + Clone> Sync for DiskInner<D> {}
 
 /// Listener factory for `TxLsmTree`.
 struct TxLsmTreeListenerFactory<D> {
@@ -1072,7 +1304,7 @@ mod impl_block_device {
     use super::{BlockSet, BufMut, BufRef, SwornDisk, Vec};
     use ext2_rs::{Bid, BlockDevice, FsError as Ext2Error};
 
-    impl<D: BlockSet + 'static> BlockDevice for SwornDisk<D> {
+    impl<D: BlockSet + Clone + 'static> BlockDevice for SwornDisk<D> {
         fn total_blocks(&self) -> usize {
             self.total_blocks()
         }

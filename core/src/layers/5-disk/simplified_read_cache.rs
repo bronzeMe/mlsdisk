@@ -7,7 +7,7 @@
 //! # Design Principles (Prefetch + No Cache)
 //!
 //! - **No persistent cache**: Eliminates large memory allocation and cache management overhead
-//! - **Small prefetch window**: 8-block sliding window for immediate sequential access
+//! - **Small prefetch window**: 32-block sliding window for immediate sequential access
 //! - **Sequential access detection**: Smart pattern recognition for intelligent prefetching
 //! - **Async prefetch**: Background read-ahead without blocking main read path
 //! - **Zero-copy delivery**: Direct prefetch window to user buffer when timing aligns
@@ -26,7 +26,7 @@ use log::debug;
 /// 1. NO PERSISTENT CACHE - Zero memory allocation for cache storage
 /// 2. SEQUENTIAL ACCESS DETECTION - Smart pattern recognition
 /// 3. INTELLIGENT PREFETCH - Async read-ahead without storage
-/// 4. PREFETCH WINDOW - Small sliding window for immediate next blocks
+/// 4. PREFETCH WINDOW - Larger sliding window for immediate read-ahead
 /// 5. ZERO-COPY DELIVERY - Direct prefetch to user buffers when possible
 /// 
 /// This approach provides:
@@ -34,19 +34,19 @@ use log::debug;
 /// - Maintained sequential read performance via prefetch
 /// - Eliminated cache management overhead
 /// - Optimized specifically for streaming workloads
-pub(super) const PREFETCH_WINDOW_SIZE: usize = 8; // Small prefetch window (32KB)
+pub(super) const PREFETCH_WINDOW_SIZE: usize = 32; // Increased prefetch window (128KB)
 
 /// Prefetch-only system for large file sequential reads.
 ///
 /// This system is designed specifically for 10-30GB file sequential reads:
 /// - NO persistent cache storage to minimize memory usage
 /// - Sequential access pattern detection for smart prefetch
-/// - Small sliding prefetch window (8 blocks) for immediate read-ahead
+/// - Small sliding prefetch window (32 blocks) for immediate read-ahead
 /// - Async prefetch without blocking main read path
 /// - Direct delivery to user buffers when timing aligns
 ///
 /// Key benefits:
-/// - Memory efficient: 32KB prefetch window vs 128MB+ cache
+/// - Memory efficient: 128KB prefetch window vs 128MB+ cache
 /// - TEE friendly: Minimal memory footprint in secure environment
 /// - Sequential optimized: Tailored for large file streaming scenarios
 /// - Zero cache management: No eviction, aging, or consistency overhead
@@ -132,7 +132,7 @@ pub struct CacheStats {
     pub prefetch_hits: usize,
     /// Current prefetch window size
     pub current_size: usize,
-    /// Prefetch window capacity (8 blocks)
+    /// Prefetch window capacity (32 blocks)
     pub capacity: usize,
 }
 
@@ -142,18 +142,20 @@ impl SimplifiedReadCache {
     /// This system implements "prefetch + no cache" design:
     /// - NO persistent cache storage (minimal memory footprint)
     /// - Sequential access pattern detection
-    /// - Smart prefetch with 8-block sliding window
+    /// - Smart prefetch with 32-block sliding window
     /// - Direct delivery to user buffers when possible
     /// - Pre-allocated buffer pool for zero-allocation prefetch
     /// 
-    /// Memory usage: ~64KB (16 blocks * 4KB) vs 128MB+ for traditional cache
+    /// Memory usage: ~192KB (48 blocks * 4KB) vs 128MB+ for traditional cache
     pub fn new() -> Result<Self> {
         #[cfg(not(feature = "linux"))]
         debug!("[PrefetchSystem] Initializing prefetch-only system with buffer pool");
         
-        // Pre-allocate buffer pool (2x prefetch window size for efficiency)
-        let mut buffer_pool = VecDeque::with_capacity(PREFETCH_WINDOW_SIZE * 2);
-        for _ in 0..(PREFETCH_WINDOW_SIZE * 2) {
+        // Pre-allocate buffer pool with better memory layout
+        // 使用reserve_exact预分配确切容量，避免动态扩容
+        let mut buffer_pool = VecDeque::new();
+        buffer_pool.reserve_exact(PREFETCH_WINDOW_SIZE * 3); // 增加缓冲池大小
+        for _ in 0..(PREFETCH_WINDOW_SIZE * 3) {
             buffer_pool.push_back(Box::new([0u8; BLOCK_SIZE]));
         }
         
@@ -172,7 +174,7 @@ impl SimplifiedReadCache {
     /// Lookup in prefetch window for large file sequential reads.
     /// 
     /// This method implements the "prefetch + no cache" approach:
-    /// - Checks 8-block prefetch window for immediate hits
+    /// - Checks 32-block prefetch window for immediate hits
     /// - Updates sequential access detection for future prefetch
     /// - Returns miss for direct LSM tree read if not prefetched
     /// - Maintains minimal lock time for high throughput
@@ -271,12 +273,24 @@ impl SimplifiedReadCache {
             Some(last_key) if key.lba == last_key.lba + 1 => {
                 inner.sequential_count += 1;
                 
-                // Generate prefetch suggestion after detecting consistent sequential pattern
+                // 更智能的顺序检测：根据访问模式强度调整预读策略
+                // 低强度顺序访问(3-5次)：保守预读
+                // 中强度顺序访问(6-10次)：中等预读
+                // 高强度顺序访问(11+次)：积极预读
+                if inner.sequential_count >= 3 {
+                    prefetch_suggestion = self.generate_prefetch_suggestion(inner, key);
+                }
+            }
+            Some(last_key) if key.lba > last_key.lba + 1 && key.lba < last_key.lba + 10 => {
+                // 允许小范围跳跃，仍然认为是顺序访问模式
+                inner.sequential_count = inner.sequential_count.saturating_add(1);
+                
                 if inner.sequential_count >= 3 {
                     prefetch_suggestion = self.generate_prefetch_suggestion(inner, key);
                 }
             }
             _ => {
+                // 重置顺序计数器
                 inner.sequential_count = 0;
             }
         }
@@ -287,14 +301,21 @@ impl SimplifiedReadCache {
     
     /// Generate intelligent prefetch suggestions based on access patterns.
     fn generate_prefetch_suggestion(&self, inner: &PrefetchState, current_key: RecordKey) -> Option<PrefetchSuggestion> {
-        // Conservative prefetch size for minimal memory usage
-        let prefetch_size = match inner.sequential_count {
-            3..=5 => 2,   // Very conservative start
-            6..=10 => 3,  // Medium confidence 
-            _ => 4,       // Maximum for memory efficiency
+        // Dynamic prefetch size based on sequential access pattern strength
+        // 3-5 sequential accesses: prefetch 2 blocks with 70% confidence
+        // 6-10 sequential accesses: prefetch 4 blocks with 85% confidence  
+        // 11+ sequential accesses: prefetch 8 blocks with 95% confidence
+        let (prefetch_size, confidence) = match inner.sequential_count {
+            3..=5 => (2, 70),
+            6..=10 => (4, 85),
+            11..=20 => (8, 95),
+            _ => (16, 98), // For very long sequential access patterns
         };
         
-        let mut suggested_keys = Vec::new();
+        // 限制最大预读大小，避免过度预读
+        let prefetch_size = prefetch_size.min(PREFETCH_WINDOW_SIZE / 2);
+        
+        let mut suggested_keys = Vec::with_capacity(prefetch_size);
         
         for i in 1..=prefetch_size {
             let prefetch_key = RecordKey { lba: current_key.lba + i };
@@ -305,26 +326,24 @@ impl SimplifiedReadCache {
             }
             
             suggested_keys.push(prefetch_key);
+            
+            // 如果预读窗口接近满载，停止添加更多预读块
+            if inner.prefetch_window.len() + suggested_keys.len() >= PREFETCH_WINDOW_SIZE {
+                break;
+            }
         }
         
         if suggested_keys.is_empty() {
             return None;
         }
         
-        // Calculate confidence based on sequential pattern strength
-        let confidence = match inner.sequential_count {
-            3..=5 => 70,   // High confidence for aggressive prefetch
-            6..=10 => 85,  // Very high confidence  
-            _ => 95,       // Maximum confidence for long sequences
-        };
-        
         #[cfg(not(feature = "linux"))]
-        debug!("[PrefetchSystem] Generated prefetch suggestion: {} keys, confidence: {}%", 
-               suggested_keys.len(), confidence);
+        debug!("[PrefetchSystem] Generated prefetch suggestion: {} keys, confidence: {}%, sequential_count: {}", 
+               suggested_keys.len(), confidence, inner.sequential_count);
                
         Some(PrefetchSuggestion {
             suggested_keys,
-            confidence,
+            confidence: confidence as u8,
         })
     }
     
@@ -358,7 +377,7 @@ impl SimplifiedReadCache {
 
     /// Insert prefetched data into the prefetch window.
     /// 
-    /// This is used by SwornDisk to store prefetched blocks in the small
+    /// This is used by SwornDisk to store prefetched blocks in the 
     /// sliding window for immediate sequential access.
     pub fn insert_prefetched(&self, key: RecordKey, data: Box<[u8; BLOCK_SIZE]>) -> Result<()> {
         let mut inner = self.inner.lock();
@@ -664,7 +683,7 @@ mod tests {
             cache.insert_prefetched(key, data).expect("Prefetch insert failed");
         }
         
-        // Should not exceed window capacity
+        // Should not exceed window capacity (32 blocks)
         assert_eq!(cache.size(), PREFETCH_WINDOW_SIZE);
         
         // Verify FIFO behavior - oldest entry (lba=0) should be evicted
