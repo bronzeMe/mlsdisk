@@ -21,6 +21,7 @@ pub(super) struct DataBlock([u8; BLOCK_SIZE]);
 impl DataBuf {
     /// Create a new empty data buffer with a given capacity.
     pub fn new(cap: usize) -> Self {
+        info!("Creating DataBuf with capacity: {}", cap);
         Self {
             buf: Mutex::new(BTreeMap::new()),
             cap,

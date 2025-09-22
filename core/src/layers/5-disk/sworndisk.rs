@@ -109,6 +109,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         disk: D,
         root_key: Key,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        data_buf_cap: usize,
     ) -> Result<Self> {
         let data_disk = Self::subdisk_for_data(&disk)?;
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
@@ -143,7 +144,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 user_data_disk: data_disk,
                 block_validity_table,
                 tx_log_store,
-                data_buf: DataBuf::new(DATA_BUF_CAP),
+                data_buf: DataBuf::new(data_buf_cap),
                 root_key,
                 is_dropped: AtomicBool::new(false),
                 write_sync_region: RwLock::new(()),
@@ -156,11 +157,12 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         Ok(new_self)
     }
 
-    /// Opens the `SwornDisk` on the given disk, with the root encryption key.
+    /// Opens `SwornDisk` on the given disk, with the root encryption key.
     pub fn open(
         disk: D,
         root_key: Key,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        data_buf_cap: usize,
     ) -> Result<Self> {
         let data_disk = Self::subdisk_for_data(&disk)?;
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
@@ -195,7 +197,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 logical_block_table,
                 user_data_disk: data_disk,
                 block_validity_table,
-                data_buf: DataBuf::new(DATA_BUF_CAP),
+                data_buf: DataBuf::new(data_buf_cap),
                 tx_log_store,
                 root_key,
                 is_dropped: AtomicBool::new(false),
@@ -806,7 +808,7 @@ mod tests {
         let mem_disk = MemDisk::create(nblocks)?;
         let root_key = Key::random();
         // Create a new `SwornDisk` then do some writes
-        let sworndisk = SwornDisk::create(mem_disk.clone(), root_key, None)?;
+        let sworndisk = SwornDisk::create(mem_disk.clone(), root_key, None, DATA_BUF_CAP)?;
         let num_rw = 1024;
 
         // Submit a write block I/O request
@@ -843,7 +845,7 @@ mod tests {
         // Open the closed `SwornDisk` then test its data's existence
         drop(sworndisk);
         thread::spawn(move || -> Result<()> {
-            let opened_sworndisk = SwornDisk::open(mem_disk, root_key, None)?;
+            let opened_sworndisk = SwornDisk::open(mem_disk, root_key, None, DATA_BUF_CAP)?;
             let mut rbuf = Buf::alloc(2)?;
             opened_sworndisk.read(5 as Lba, rbuf.as_mut())?;
             assert_eq!(rbuf.as_slice()[0], 5u8);
